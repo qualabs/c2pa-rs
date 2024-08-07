@@ -1380,7 +1380,7 @@ impl CAIWriter for BmffIO {
 
         // get ftyp location
         // start after ftyp
-        let ftyp_token = bmff_map.get("/ftyp").ok_or(Error::UnsupportedType)?; // todo check ftyps to make sure we support any special format requirements
+        let ftyp_token = bmff_map.get("/styp").ok_or(Error::UnsupportedType)?; // todo check ftyps to make sure we support any special format requirements
         let ftyp_info = &bmff_tree[ftyp_token[0]].data;
         let ftyp_offset = ftyp_info.offset;
         let ftyp_size = ftyp_info.size;
