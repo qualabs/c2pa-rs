@@ -13,36 +13,47 @@
 
 //! Support for C2PA Live Video validation (section 19 of the C2PA Technical Specification).
 //!
-//! Implements the per-segment C2PA Manifest Box method (section 19.3), where each segment
-//! carries its own C2PA Manifest with a [`LiveVideoSegment`] assertion for continuity tracking.
+//! Implements two validation methods:
+//!
+//! - **Section 19.3** (per-segment C2PA Manifest Box): each segment carries its own C2PA
+//!   Manifest with a [`LiveVideoSegment`] assertion. Use [`LiveVideoValidator::validate_media_segment`].
+//!
+//! - **Section 19.4** (Verifiable Segment Info): the init segment manifest contains a
+//!   [`crate::assertions::SessionKeys`] assertion; each media segment carries a COSE_Sign1 in
+//!   an `emsg` box. Use [`LiveVideoValidator::validate_session_keys`] and
+//!   [`LiveVideoValidator::validate_verifiable_segment_info`].
 //!
 //! See [C2PA Technical Specification — Live Video](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_live_video).
+
+pub(crate) mod cose_key;
+pub mod verifiable_segment_info;
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use crate::{
-    assertions::{ContinuityMethod, LiveVideoSegment},
+    assertions::{ContinuityMethod, LiveVideoSegment, SessionKey, SessionKeys},
+    crypto::raw_signature::validator_for_signing_alg,
     error::{Error, Result},
     log_item,
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
         LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_CONTINUITY_METHOD_INVALID,
         LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID, LIVEVIDEO_SEGMENT_INVALID,
+        LIVEVIDEO_SESSIONKEY_INVALID,
     },
 };
 
-/// FourCC byte value for an ISO BMFF `mdat` (Media Data) box.
+use self::{
+    cose_key::{cose_key_to_der, kid_from_cose_key, signing_alg_from_cose_key},
+    verifiable_segment_info::{extract_vsi_payload_from_segment, parse_vsi},
+};
+
 const MDAT_BOX_TYPE: u32 = 0x6d646174;
-
-/// FourCC byte value for an ISO BMFF `uuid` (User Data) box.
 const UUID_BOX_TYPE: u32 = 0x75756964;
-
-/// FourCC byte value for an ISO BMFF `emsg` (Event Message) box.
 const EMSG_BOX_TYPE: u32 = 0x656d7367;
 
+
 /// C2PA UUID identifying a `uuid` box that contains a C2PA Manifest Store.
-///
-/// See [C2PA Technical Specification section A.5.1](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_the_uuid_box_for_c2pa).
 const C2PA_UUID: [u8; 16] = [
     0xd8, 0xfe, 0xc3, 0xd6, 0x1b, 0x0e, 0x48, 0x3c,
     0x92, 0x97, 0x58, 0x28, 0x87, 0x7e, 0xc4, 0x81,
@@ -60,31 +71,32 @@ fn fail_validation(
     Ok(())
 }
 
-/// Snapshot of the validated state from the most recently accepted segment.
-///
-/// Used to enforce cross-segment continuity rules ([section 19.7.2](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_live_video_validation_process)).
 struct SegmentState {
     sequence_number: u64,
     stream_id: String,
     manifest_id: String,
 }
 
-/// Validates a sequence of live video segments against the C2PA section 19 rules.
+/// Validates a sequence of live video segments against C2PA section 19 rules.
 ///
-/// Create one instance per live stream and call [`validate_init_segment`] followed by
-/// [`validate_media_segment`] for each subsequent segment, in order.
+/// Supports section [19.3] (per-segment C2PA Manifest Box) and section [19.4] (Verifiable
+/// Segment Info). Create one instance per live stream; for 19.4 call
+/// [`validate_session_keys`] after [`validate_init_segment`].
 ///
+/// [19.3]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#using_c2pa_manifest_box
+/// [19.4]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#verifiable_segment_info
+/// [`validate_session_keys`]: LiveVideoValidator::validate_session_keys
 /// [`validate_init_segment`]: LiveVideoValidator::validate_init_segment
-/// [`validate_media_segment`]: LiveVideoValidator::validate_media_segment
 pub struct LiveVideoValidator {
     previous_segment: Option<SegmentState>,
+    session_keys: Vec<SessionKey>,
 }
 
 impl LiveVideoValidator {
-    /// Creates a new validator for a live stream.
     pub fn new() -> Self {
         Self {
             previous_segment: None,
+            session_keys: Vec::new(),
         }
     }
 
@@ -216,6 +228,239 @@ impl LiveVideoValidator {
         }
     }
 
+    /// Validates a `c2pa.session-keys` assertion and stores the keys for VSI verification ([§19.4]).
+    ///
+    /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#verifiable_segment_info
+    pub fn validate_session_keys(
+        &mut self,
+        assertion: &SessionKeys,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if assertion.keys.is_empty() {
+            return fail_validation(
+                "session-keys assertion must contain at least one key",
+                LIVEVIDEO_SESSIONKEY_INVALID,
+                tracker,
+            );
+        }
+
+        for key in &assertion.keys {
+            if key.validity_period == 0 {
+                return fail_validation(
+                    "session key validityPeriod must be greater than zero",
+                    LIVEVIDEO_SESSIONKEY_INVALID,
+                    tracker,
+                );
+            }
+        }
+
+        self.session_keys = assertion.keys.clone();
+        Ok(())
+    }
+
+    /// Validates a media segment using the Verifiable Segment Info method ([§19.4]).
+    ///
+    /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#verifiable_segment_info
+    pub fn validate_verifiable_segment_info(
+        &mut self,
+        segment_data: &[u8],
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        self.require_session_keys(tracker)?;
+        let parsed = self.extract_and_parse_vsi(segment_data, tracker)?;
+        let session_key = self.resolve_session_key(&parsed.sign1, tracker)?;
+        let seq_num = parsed.segment_info_map.sequence_number;
+
+        self.validate_vsi_sequence_bounds(seq_num, &session_key, tracker)?;
+        self.validate_vsi_key_validity(&session_key, tracker)?;
+        self.validate_vsi_signature(&parsed.sign1, &session_key, tracker)?;
+        self.validate_vsi_sequence_continuity(seq_num, tracker)?;
+
+        self.previous_segment = Some(SegmentState {
+            sequence_number: seq_num,
+            stream_id: String::new(),
+            manifest_id: parsed.segment_info_map.manifest_id.clone(),
+        });
+
+        Ok(())
+    }
+
+    fn require_session_keys(&self, tracker: &mut StatusTracker) -> Result<()> {
+        if self.session_keys.is_empty() {
+            return fail_validation(
+                "no session keys available; validate_session_keys must be called first",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            );
+        }
+        Ok(())
+    }
+
+    fn extract_and_parse_vsi(
+        &self,
+        segment_data: &[u8],
+        tracker: &mut StatusTracker,
+    ) -> Result<verifiable_segment_info::ParsedVsi> {
+        let vsi_bytes = match extract_vsi_payload_from_segment(segment_data) {
+            Some(bytes) => bytes,
+            None => {
+                fail_validation(
+                    "segment must contain a VSI emsg box (urn:c2pa:verifiable-segment-info)",
+                    LIVEVIDEO_SEGMENT_INVALID,
+                    tracker,
+                )?;
+                return Err(Error::BadParam("livevideo.segment.invalid".into()));
+            }
+        };
+
+        parse_vsi(&vsi_bytes).map_err(|_| {
+            let _ = fail_validation(
+                "failed to parse SegmentInfoMap from VSI COSE_Sign1 payload",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            );
+            Error::BadParam("livevideo.segment.invalid".into())
+        })
+    }
+
+    fn resolve_session_key(
+        &self,
+        sign1: &coset::CoseSign1,
+        tracker: &mut StatusTracker,
+    ) -> Result<SessionKey> {
+        let kid = &sign1.unprotected.key_id;
+        if kid.is_empty() {
+            fail_validation(
+                "COSE_Sign1 unprotected header must contain a kid identifying the session key",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            )?;
+            return Err(Error::BadParam("livevideo.segment.invalid".into()));
+        }
+
+        match self.find_session_key_by_kid(kid) {
+            Some(sk) => Ok(sk),
+            None => {
+                fail_validation(
+                    "no session key matches the kid in the COSE_Sign1 unprotected header",
+                    LIVEVIDEO_SESSIONKEY_INVALID,
+                    tracker,
+                )?;
+                Err(Error::BadParam("livevideo.sessionkey.invalid".into()))
+            }
+        }
+    }
+
+    fn validate_vsi_sequence_bounds(
+        &self,
+        seq_num: u64,
+        session_key: &SessionKey,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if seq_num < session_key.min_sequence_number {
+            return fail_validation(
+                "sequenceNumber is below the session key's minSequenceNumber",
+                LIVEVIDEO_ASSERTION_INVALID,
+                tracker,
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_vsi_key_validity(
+        &self,
+        session_key: &SessionKey,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if let Err(msg) = self.check_key_validity_period(session_key) {
+            return fail_validation(msg, LIVEVIDEO_SESSIONKEY_INVALID, tracker);
+        }
+        Ok(())
+    }
+
+    fn validate_vsi_signature(
+        &self,
+        sign1: &coset::CoseSign1,
+        session_key: &SessionKey,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if let Err(msg) = self.verify_cose_sign1(sign1, session_key) {
+            return fail_validation(msg, LIVEVIDEO_SEGMENT_INVALID, tracker);
+        }
+        Ok(())
+    }
+
+    fn validate_vsi_sequence_continuity(
+        &self,
+        seq_num: u64,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if let Some(previous) = &self.previous_segment {
+            if seq_num <= previous.sequence_number {
+                return fail_validation(
+                    "VSI sequenceNumber must be strictly greater than the previous segment's",
+                    LIVEVIDEO_ASSERTION_INVALID,
+                    tracker,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn find_session_key_by_kid(&self, kid: &[u8]) -> Option<SessionKey> {
+        self.session_keys.iter().find(|sk| {
+            kid_from_cose_key(&sk.key)
+                .map(|k| k == kid)
+                .unwrap_or(false)
+        }).cloned()
+    }
+
+    fn check_key_validity_period(&self, key: &SessionKey) -> std::result::Result<(), String> {
+        use chrono::{DateTime, Duration, Utc};
+
+        let created_at: DateTime<Utc> = key
+            .created_at
+            .0
+            .parse()
+            .map_err(|_| "session key createdAt is not a valid RFC 3339 datetime".to_string())?;
+
+        let validity_seconds = i64::try_from(key.validity_period)
+            .map_err(|_| "validityPeriod overflow".to_string())?;
+
+        let expires_at = created_at + Duration::seconds(validity_seconds);
+        let now = Utc::now();
+
+        if now > expires_at {
+            return Err(format!(
+                "session key expired: createdAt={}, validityPeriod={}s, now={}",
+                key.created_at.0, key.validity_period, now
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn verify_cose_sign1(
+        &self,
+        sign1: &coset::CoseSign1,
+        session_key: &SessionKey,
+    ) -> std::result::Result<(), String> {
+        let alg = signing_alg_from_cose_key(&session_key.key)
+            .ok_or_else(|| "unsupported key type/curve in session key".to_string())?;
+
+        let public_key_der = cose_key_to_der(&session_key.key)
+            .ok_or_else(|| "failed to convert session key to DER".to_string())?;
+
+        let validator = validator_for_signing_alg(alg)
+            .ok_or_else(|| format!("no validator available for {alg:?}"))?;
+
+        let tbs = sign1.tbs_data(b"");
+
+        validator
+            .validate(&sign1.signature, &tbs, &public_key_der)
+            .map_err(|e| format!("COSE_Sign1 signature verification failed: {e}"))
+    }
+
     fn validate_manifest_id_continuity(
         &self,
         assertion: &LiveVideoSegment,
@@ -335,7 +580,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        assertions::{ContinuityMethod, LiveVideoSegment},
+        assertions::{ContinuityMethod, LiveVideoSegment, SessionKey, SessionKeys},
+        cbor_types::DateT,
         status_tracker::StatusTracker,
     };
 
@@ -676,5 +922,355 @@ mod tests {
             i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
         });
         assert!(!has_segment_invalid);
+    }
+
+    // ── 19.4 helpers ──────────────────────────────────────────────────────────
+
+    fn cbor_int(val: i64) -> c2pa_cbor::Value {
+        c2pa_cbor::Value::Integer(val)
+    }
+
+    fn minimal_session_keys() -> SessionKeys {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(cbor_int(1), cbor_int(2));   // kty: EC2
+        map.insert(cbor_int(2), c2pa_cbor::Value::Bytes(b"k".to_vec())); // kid
+        map.insert(cbor_int(-1), cbor_int(1));  // crv: P-256
+        map.insert(cbor_int(-2), c2pa_cbor::Value::Bytes(vec![0; 32]));
+        map.insert(cbor_int(-3), c2pa_cbor::Value::Bytes(vec![0; 32]));
+
+        SessionKeys {
+            keys: vec![SessionKey {
+                key: c2pa_cbor::Value::Map(map),
+                min_sequence_number: 0,
+                created_at: DateT(chrono::Utc::now().to_rfc3339()),
+                validity_period: 3600,
+                signer_binding: c2pa_cbor::Value::Bytes(vec![]),
+            }],
+        }
+    }
+
+    /// Builds an `emsg` version 0 box with C2PA VSI scheme carrying `message_data`.
+    #[cfg(feature = "rust_native_crypto")]
+    fn make_vsi_emsg_box(message_data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"urn:c2pa:verifiable-segment-info\0");
+        body.extend_from_slice(b"fseg\0");
+        body.extend_from_slice(&[0u8; 16]); // timescale + pts_delta + duration + id
+        body.extend_from_slice(message_data);
+
+        let total_size = (8u32 + 4 + body.len() as u32).to_be_bytes();
+        let mut emsg = Vec::new();
+        emsg.extend_from_slice(&total_size);
+        emsg.extend_from_slice(b"emsg");
+        emsg.push(0); // version 0
+        emsg.extend_from_slice(&[0u8; 3]); // flags
+        emsg.extend_from_slice(&body);
+        emsg
+    }
+
+    // ── 19.4 helpers that require rust_native_crypto (P-256 key generation) ──
+
+    #[cfg(feature = "rust_native_crypto")]
+    mod vsi_crypto_helpers {
+        use super::*;
+        use crate::live_video::verifiable_segment_info::SegmentInfoMap;
+
+        pub const TEST_KID: &[u8] = b"test-key-1";
+
+        pub fn generate_test_key_pair() -> (p256::ecdsa::SigningKey, c2pa_cbor::Value) {
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+            let verifying_key = signing_key.verifying_key();
+            let point = verifying_key.to_encoded_point(false);
+
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(cbor_int(1), cbor_int(2));   // kty: EC2
+            map.insert(cbor_int(2), c2pa_cbor::Value::Bytes(TEST_KID.to_vec()));
+            map.insert(cbor_int(-1), cbor_int(1));  // crv: P-256
+            map.insert(cbor_int(-2), c2pa_cbor::Value::Bytes(point.x().unwrap().to_vec()));
+            map.insert(cbor_int(-3), c2pa_cbor::Value::Bytes(point.y().unwrap().to_vec()));
+
+            (signing_key, c2pa_cbor::Value::Map(map))
+        }
+
+        pub fn session_keys_with_cose_key(cose_key: c2pa_cbor::Value) -> SessionKeys {
+            SessionKeys {
+                keys: vec![SessionKey {
+                    key: cose_key,
+                    min_sequence_number: 0,
+                    created_at: DateT(chrono::Utc::now().to_rfc3339()),
+                    validity_period: 3600,
+                    signer_binding: c2pa_cbor::Value::Bytes(vec![]),
+                }],
+            }
+        }
+
+        pub fn make_signed_cose_sign1_bytes(
+            segment_info_map: &SegmentInfoMap,
+            signing_key: &p256::ecdsa::SigningKey,
+        ) -> Vec<u8> {
+            use coset::{iana, HeaderBuilder, TaggedCborSerializable};
+            use p256::ecdsa::{signature::Signer, Signature};
+
+            let payload = c2pa_cbor::to_vec(segment_info_map).unwrap();
+
+            let protected = HeaderBuilder::new()
+                .algorithm(iana::Algorithm::ES256)
+                .build();
+
+            let unprotected = HeaderBuilder::new()
+                .key_id(TEST_KID.to_vec())
+                .build();
+
+            let mut sign1 = coset::CoseSign1Builder::new()
+                .protected(protected)
+                .unprotected(unprotected)
+                .payload(payload)
+                .build();
+
+            let tbs = sign1.tbs_data(b"");
+            let sig: Signature = signing_key.sign(&tbs);
+            sign1.signature = sig.to_bytes().to_vec();
+
+            sign1.to_tagged_vec().unwrap()
+        }
+
+        pub fn make_signed_vsi_segment(
+            sequence_number: u64,
+            manifest_id: &str,
+            signing_key: &p256::ecdsa::SigningKey,
+        ) -> Vec<u8> {
+            let map = SegmentInfoMap {
+                sequence_number,
+                bmff_hash: c2pa_cbor::Value::Null,
+                manifest_id: manifest_id.to_string(),
+                manifest_uri: None,
+            };
+            super::make_vsi_emsg_box(&make_signed_cose_sign1_bytes(&map, signing_key))
+        }
+
+        pub fn setup_vsi_validator() -> (LiveVideoValidator, p256::ecdsa::SigningKey) {
+            let (signing_key, cose_key) = generate_test_key_pair();
+            let mut validator = LiveVideoValidator::new();
+            let mut tracker = StatusTracker::default();
+            let keys = session_keys_with_cose_key(cose_key);
+            validator.validate_session_keys(&keys, &mut tracker).unwrap();
+            (validator, signing_key)
+        }
+    }
+
+    // ── 19.4 validate_session_keys tests ──────────────────────────────────────
+
+    #[test]
+    fn session_keys_empty_fails() {
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+
+        let _ = validator.validate_session_keys(&SessionKeys { keys: vec![] }, &mut tracker);
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SESSIONKEY_INVALID)
+        }));
+    }
+
+    #[test]
+    fn session_keys_zero_validity_period_fails() {
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+
+        let keys = SessionKeys {
+            keys: vec![SessionKey {
+                validity_period: 0,
+                ..minimal_session_keys().keys.remove(0)
+            }],
+        };
+        let _ = validator.validate_session_keys(&keys, &mut tracker);
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SESSIONKEY_INVALID)
+        }));
+    }
+
+    #[test]
+    fn session_keys_valid_produces_no_errors() {
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+
+        validator
+            .validate_session_keys(&minimal_session_keys(), &mut tracker)
+            .unwrap();
+
+        assert!(!tracker.logged_items().iter().any(|i| {
+            i.validation_status
+                .as_deref()
+                .map(|s| s.starts_with("livevideo"))
+                .unwrap_or(false)
+        }));
+    }
+
+    // ── 19.4 validate_verifiable_segment_info tests ───────────────────────────
+
+    #[test]
+    fn vsi_without_session_keys_fails() {
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+
+        let _ = validator.validate_verifiable_segment_info(&make_mdat_box(), &mut tracker);
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_segment_without_emsg_fails() {
+        let (mut validator, _) = vsi_crypto_helpers::setup_vsi_validator();
+        let mut tracker = aggregate_tracker();
+
+        let _ = validator.validate_verifiable_segment_info(&make_mdat_box(), &mut tracker);
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_segment_with_invalid_cose_fails() {
+        let (mut validator, _) = vsi_crypto_helpers::setup_vsi_validator();
+        let mut tracker = aggregate_tracker();
+
+        let segment = make_vsi_emsg_box(b"not-a-cose-sign1");
+        let _ = validator.validate_verifiable_segment_info(&segment, &mut tracker);
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_valid_sequence_advances_state() {
+        use vsi_crypto_helpers::*;
+        let (mut validator, signing_key) = setup_vsi_validator();
+        let mut tracker = aggregate_tracker();
+
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(1, "manifest-1", &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(2, "manifest-2", &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+
+        assert!(!tracker.logged_items().iter().any(|i| {
+            i.validation_status
+                .as_deref()
+                .map(|s| s.starts_with("livevideo"))
+                .unwrap_or(false)
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_regressed_sequence_number_fails() {
+        use vsi_crypto_helpers::*;
+        let (mut validator, signing_key) = setup_vsi_validator();
+        let mut tracker = aggregate_tracker();
+
+        let _ = validator.validate_verifiable_segment_info(
+            &make_signed_vsi_segment(5, "m-1", &signing_key),
+            &mut tracker,
+        );
+        let _ = validator.validate_verifiable_segment_info(
+            &make_signed_vsi_segment(4, "m-2", &signing_key),
+            &mut tracker,
+        );
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_ASSERTION_INVALID)
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_min_sequence_number_enforced() {
+        use vsi_crypto_helpers::*;
+        let (signing_key, cose_key) = generate_test_key_pair();
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+
+        let keys = SessionKeys {
+            keys: vec![SessionKey {
+                min_sequence_number: 10,
+                ..session_keys_with_cose_key(cose_key).keys.remove(0)
+            }],
+        };
+        validator.validate_session_keys(&keys, &mut tracker).unwrap();
+
+        let _ = validator.validate_verifiable_segment_info(
+            &make_signed_vsi_segment(5, "m-1", &signing_key),
+            &mut tracker,
+        );
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_ASSERTION_INVALID)
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_expired_key_fails() {
+        use vsi_crypto_helpers::*;
+        let (signing_key, cose_key) = generate_test_key_pair();
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+
+        let keys = SessionKeys {
+            keys: vec![SessionKey {
+                created_at: DateT("2020-01-01T00:00:00Z".to_string()),
+                validity_period: 1,
+                ..session_keys_with_cose_key(cose_key).keys.remove(0)
+            }],
+        };
+        validator.validate_session_keys(&keys, &mut tracker).unwrap();
+
+        let _ = validator.validate_verifiable_segment_info(
+            &make_signed_vsi_segment(1, "m-1", &signing_key),
+            &mut tracker,
+        );
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SESSIONKEY_INVALID)
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_bad_signature_fails() {
+        use vsi_crypto_helpers::*;
+        let (_, cose_key) = generate_test_key_pair();
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+
+        let keys = session_keys_with_cose_key(cose_key);
+        validator.validate_session_keys(&keys, &mut tracker).unwrap();
+
+        let (other_key, _) = generate_test_key_pair();
+        let _ = validator.validate_verifiable_segment_info(
+            &make_signed_vsi_segment(1, "m-1", &other_key),
+            &mut tracker,
+        );
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
+        }));
     }
 }
