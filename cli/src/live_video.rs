@@ -19,15 +19,27 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use c2pa::{
-    assertions::LiveVideoSegment,
+    assertions::{LiveVideoSegment, SessionKeys},
     format_from_path,
     live_video::LiveVideoValidator,
     status_tracker::StatusTracker,
     Reader,
 };
 
-/// Validates an init segment and a sequence of media segments against the
-/// C2PA Live Video section 19.3 rules (per-segment C2PA Manifest Box method https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#using_c2pa_manifest_box).
+/// Which C2PA Live Video validation method the init segment advertises.
+enum ValidationMethod {
+    /// Section 19.3: each segment carries a C2PA Manifest Box with a `LiveVideoSegment` assertion.
+    ManifestBox,
+    /// Section 19.4: each segment carries a `COSE_Sign1` in an `emsg` box (Verifiable Segment Info).
+    VerifiableSegmentInfo,
+}
+
+/// Validates an init segment and a sequence of media segments against C2PA Live Video rules.
+///
+/// The validation method (section 19.3 or 19.4) is detected automatically from the init
+/// segment manifest:
+/// - If the manifest contains a `c2pa.session-keys` assertion → section 19.4 (VSI).
+/// - Otherwise → section 19.3 (per-segment C2PA Manifest Box).
 ///
 /// `segments_glob` is resolved relative to `init_path`'s directory and matched
 /// in lexicographic order.
@@ -41,6 +53,18 @@ pub fn validate_live_video(init_path: &Path, segments_glob: &Path) -> Result<()>
     match live_validator.validate_init_segment(&init_data, &mut tracker) {
         Ok(_) => println!("Init OK:   {init_path:?}"),
         Err(e) => eprintln!("Init FAIL: {init_path:?}: {e}"),
+    }
+
+    let method = detect_validation_method(
+        init_path,
+        &init_data,
+        &mut live_validator,
+        &mut tracker,
+    );
+
+    match &method {
+        ValidationMethod::ManifestBox => println!("Method:    19.3 (per-segment C2PA Manifest Box)"),
+        ValidationMethod::VerifiableSegmentInfo => println!("Method:    19.4 (Verifiable Segment Info)"),
     }
 
     let segment_paths = collect_segments(init_path, segments_glob)?;
@@ -57,7 +81,15 @@ pub fn validate_live_video(init_path: &Path, segments_glob: &Path) -> Result<()>
     let mut failed_count = 0usize;
 
     for segment_path in &segment_paths {
-        if !validate_segment(segment_path, &mut live_validator, &mut tracker) {
+        let ok = match method {
+            ValidationMethod::ManifestBox => {
+                validate_segment_manifest_box(segment_path, &mut live_validator, &mut tracker)
+            }
+            ValidationMethod::VerifiableSegmentInfo => {
+                validate_segment_vsi(segment_path, &mut live_validator, &mut tracker)
+            }
+        };
+        if !ok {
             failed_count += 1;
         }
     }
@@ -84,6 +116,37 @@ pub fn validate_live_video(init_path: &Path, segments_glob: &Path) -> Result<()>
     }
 }
 
+/// Detects the validation method from the init segment manifest.
+///
+/// If the manifest contains a `c2pa.session-keys` assertion, validates and registers the keys
+/// in `live_validator` for subsequent VSI segment validation. Returns the detected method.
+fn detect_validation_method(
+    init_path: &Path,
+    init_data: &[u8],
+    live_validator: &mut LiveVideoValidator,
+    tracker: &mut StatusTracker,
+) -> ValidationMethod {
+    let format = format_from_path(init_path).unwrap_or_else(|| "video/mp4".to_string());
+
+    let reader = match Reader::from_stream(&format, Cursor::new(init_data)) {
+        Ok(r) => r,
+        Err(_) => return ValidationMethod::ManifestBox,
+    };
+
+    let manifest = match reader.active_manifest() {
+        Some(m) => m,
+        None => return ValidationMethod::ManifestBox,
+    };
+
+    match manifest.find_assertion::<SessionKeys>(SessionKeys::LABEL) {
+        Ok(session_keys) => {
+            let _ = live_validator.validate_session_keys(&session_keys, tracker);
+            ValidationMethod::VerifiableSegmentInfo
+        }
+        Err(_) => ValidationMethod::ManifestBox,
+    }
+}
+
 fn collect_segments(init_path: &Path, segments_glob: &Path) -> Result<Vec<PathBuf>> {
     let init_dir = init_path
         .parent()
@@ -102,7 +165,8 @@ fn collect_segments(init_path: &Path, segments_glob: &Path) -> Result<Vec<PathBu
     Ok(paths)
 }
 
-fn validate_segment(
+/// Validates one segment using section 19.3 (per-segment C2PA Manifest Box).
+fn validate_segment_manifest_box(
     segment_path: &Path,
     live_validator: &mut LiveVideoValidator,
     tracker: &mut StatusTracker,
@@ -153,6 +217,32 @@ fn validate_segment(
     };
 
     match live_validator.validate_media_segment(&segment_data, &manifest_id, &assertion, tracker) {
+        Ok(_) => {
+            println!("Segment OK  [{segment_path:?}]");
+            true
+        }
+        Err(e) => {
+            eprintln!("Segment FAIL [{segment_path:?}]: {e}");
+            false
+        }
+    }
+}
+
+/// Validates one segment using section 19.4 (Verifiable Segment Info).
+fn validate_segment_vsi(
+    segment_path: &Path,
+    live_validator: &mut LiveVideoValidator,
+    tracker: &mut StatusTracker,
+) -> bool {
+    let segment_data = match fs::read(segment_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Segment FAIL [{segment_path:?}]: cannot read file: {e}");
+            return false;
+        }
+    };
+
+    match live_validator.validate_verifiable_segment_info(&segment_data, tracker) {
         Ok(_) => {
             println!("Segment OK  [{segment_path:?}]");
             true
