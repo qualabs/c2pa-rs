@@ -245,6 +245,14 @@ impl LiveVideoValidator {
         }
 
         for key in &assertion.keys {
+            if kid_from_cose_key(&key.key).is_none() {
+                return fail_validation(
+                    "session key COSE_Key must include a kid (key identifier)",
+                    LIVEVIDEO_SESSIONKEY_INVALID,
+                    tracker,
+                );
+            }
+
             if key.validity_period == 0 {
                 return fail_validation(
                     "session key validityPeriod must be greater than zero",
@@ -252,6 +260,11 @@ impl LiveVideoValidator {
                     tracker,
                 );
             }
+
+            // TODO: verify signerBinding — the COSE_Sign1 should be verified using the
+            // session key's private counterpart against the signer's end-entity certificate
+            // (§19.7.3). Requires access to the certificate chain from the manifest signature,
+            // which is not yet plumbed through to this validation path.
         }
 
         self.session_keys = assertion.keys.clone();
@@ -275,6 +288,10 @@ impl LiveVideoValidator {
         self.validate_vsi_key_validity(&session_key, tracker)?;
         self.validate_vsi_signature(&parsed.sign1, &session_key, tracker)?;
         self.validate_vsi_sequence_continuity(seq_num, tracker)?;
+        // TODO: validate bmffHash — verify the segment's content hash against
+        // parsed.segment_info_map.bmff_hash (§19.7.3). Requires running the BMFF
+        // hash computation over segment_data with the exclusions defined in §19.4.1,
+        // which depends on the bmff-hash infrastructure not yet wired into this path.
 
         self.previous_segment = Some(SegmentState {
             sequence_number: seq_num,
@@ -360,7 +377,7 @@ impl LiveVideoValidator {
         if seq_num < session_key.min_sequence_number {
             return fail_validation(
                 "sequenceNumber is below the session key's minSequenceNumber",
-                LIVEVIDEO_ASSERTION_INVALID,
+                LIVEVIDEO_SEGMENT_INVALID,
                 tracker,
             );
         }
@@ -1092,6 +1109,30 @@ mod tests {
     }
 
     #[test]
+    fn session_keys_missing_kid_fails() {
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+
+        // COSE_Key without kid: only kty and crv/x/y, no kid field.
+        let mut key_map = std::collections::BTreeMap::new();
+        key_map.insert(
+            c2pa_cbor::Value::Integer(1),
+            c2pa_cbor::Value::Integer(2), // kty: EC2
+        );
+        let keys = SessionKeys {
+            keys: vec![SessionKey {
+                key: c2pa_cbor::Value::Map(key_map),
+                ..minimal_session_keys().keys.remove(0)
+            }],
+        };
+        let _ = validator.validate_session_keys(&keys, &mut tracker);
+
+        assert!(tracker.logged_items().iter().any(|i| {
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SESSIONKEY_INVALID)
+        }));
+    }
+
+    #[test]
     fn session_keys_valid_produces_no_errors() {
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
@@ -1221,7 +1262,7 @@ mod tests {
         );
 
         assert!(tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_ASSERTION_INVALID)
+            i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
         }));
     }
 
