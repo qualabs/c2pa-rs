@@ -22,6 +22,7 @@ use c2pa::{
     assertions::{LiveVideoSegment, SessionKeys},
     format_from_path,
     live_video::LiveVideoValidator,
+    Manifest,
     status_tracker::StatusTracker,
     Reader,
 };
@@ -140,11 +141,24 @@ fn detect_validation_method(
 
     match manifest.find_assertion::<SessionKeys>(SessionKeys::LABEL) {
         Ok(session_keys) => {
-            let _ = live_validator.validate_session_keys(&session_keys, tracker);
+            let ee_cert_der = extract_ee_cert_der(manifest);
+            let _ = live_validator.validate_session_keys(
+                &session_keys,
+                ee_cert_der.as_deref(),
+                tracker,
+            );
             ValidationMethod::VerifiableSegmentInfo
         }
         Err(_) => ValidationMethod::ManifestBox,
     }
+}
+
+/// Extracts the DER-encoded end-entity certificate from a manifest's PEM cert chain.
+fn extract_ee_cert_der(manifest: &Manifest) -> Option<Vec<u8>> {
+    let si = manifest.signature_info()?;
+    let pems = pem::parse_many(si.cert_chain()).ok()?;
+    let first = pems.into_iter().next()?;
+    Some(first.into_contents())
 }
 
 fn collect_segments(init_path: &Path, segments_glob: &Path) -> Result<Vec<PathBuf>> {
