@@ -153,10 +153,16 @@ impl LiveVideoValidator {
 
     /// Validates a `c2pa.session-keys` assertion and stores the keys for VSI verification ([§19.4]).
     ///
+    /// If `ee_cert_der` is provided (the DER-encoded end-entity certificate from the manifest
+    /// signer), each key's `signerBinding` COSE_Sign1 is verified against it ([§19.7.3]).
+    /// Callers SHOULD provide the certificate for spec-compliant validation.
+    ///
     /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#verifiable_segment_info
+    /// [§19.7.3]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_verifiable_segment_info_validation
     pub fn validate_session_keys(
         &mut self,
         assertion: &SessionKeys,
+        ee_cert_der: Option<&[u8]>,
         tracker: &mut StatusTracker,
     ) -> Result<()> {
         if assertion.keys.is_empty() {
@@ -184,10 +190,9 @@ impl LiveVideoValidator {
                 );
             }
 
-            // TODO: verify signerBinding — the COSE_Sign1 should be verified using the
-            // session key's private counterpart against the signer's end-entity certificate
-            // (§19.7.3). Requires access to the certificate chain from the manifest signature,
-            // which is not yet plumbed through to this validation path.
+            if let Some(cert) = ee_cert_der {
+                self.verify_signer_binding(key, cert, tracker)?;
+            }
         }
 
         self.session_keys = assertion.keys.clone();
