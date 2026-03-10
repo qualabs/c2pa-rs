@@ -216,10 +216,11 @@ impl LiveVideoValidator {
         self.validate_vsi_key_validity(&session_key, tracker)?;
         self.validate_vsi_signature(&parsed.sign1, &session_key, tracker)?;
         self.validate_vsi_sequence_continuity(seq_num, tracker)?;
-        // TODO: validate bmffHash — verify the segment's content hash against
-        // parsed.segment_info_map.bmff_hash (§19.7.3). Requires running the BMFF
-        // hash computation over segment_data with the exclusions defined in §19.4.1,
-        // which depends on the bmff-hash infrastructure not yet wired into this path.
+        self.validate_vsi_bmff_hash(
+            segment_data,
+            &parsed.segment_info_map.bmff_hash,
+            tracker,
+        )?;
 
         self.previous_segment = Some(SegmentState {
             sequence_number: seq_num,

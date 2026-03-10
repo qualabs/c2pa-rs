@@ -153,6 +153,42 @@ impl LiveVideoValidator {
         Ok(())
     }
 
+    /// Verifies the segment's BMFF hash against the `bmffHash` in the segment-info-map (§19.7.3).
+    ///
+    /// If the `bmffHash` field is `Null`, verification is skipped.
+    pub(super) fn validate_vsi_bmff_hash(
+        &self,
+        segment_data: &[u8],
+        bmff_hash_value: &c2pa_cbor::Value,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if bmff_hash_value.is_null() {
+            return Ok(());
+        }
+
+        let bmff_hash: crate::assertions::BmffHash =
+            match c2pa_cbor::value::from_value(bmff_hash_value.clone()) {
+                Ok(h) => h,
+                Err(e) => {
+                    return fail_validation(
+                        format!("failed to deserialize bmffHash from segment-info-map: {e}"),
+                        LIVEVIDEO_SEGMENT_INVALID,
+                        tracker,
+                    );
+                }
+            };
+
+        if let Err(e) = bmff_hash.verify_in_memory_hash(segment_data, None) {
+            return fail_validation(
+                format!("segment bmffHash verification failed: {e}"),
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            );
+        }
+
+        Ok(())
+    }
+
     fn find_session_key_by_kid(&self, kid: &[u8]) -> Option<SessionKey> {
         self.session_keys
             .iter()
