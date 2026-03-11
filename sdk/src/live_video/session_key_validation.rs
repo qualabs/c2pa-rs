@@ -13,7 +13,7 @@
 
 use crate::{
     assertions::SessionKey,
-    crypto::{cose::signing_alg_from_sign1, raw_signature::validator_for_signing_alg},
+    crypto::raw_signature::validator_for_signing_alg,
     error::{Error, Result},
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
@@ -246,8 +246,12 @@ impl LiveVideoValidator {
             .map_err(|e| format!("COSE_Sign1 signature verification failed: {e}"))
     }
 
-    /// Verifies the `signerBinding` COSE_Sign1 on a session key against the manifest signer's
-    /// end-entity certificate (§19.7.3).
+    /// Verifies the `signerBinding` detached COSE_Sign1 on a session key (§18.25.2).
+    ///
+    /// Per the spec the `signerBinding` is signed by the **session key** and the
+    /// detached payload is the signer's end-entity certificate encoded as a CBOR
+    /// byte string.  Verification uses the session key's public key (from the
+    /// `key` field of the session-key object).
     pub(super) fn verify_signer_binding(
         &self,
         key: &SessionKey,
@@ -277,22 +281,22 @@ impl LiveVideoValidator {
             }
         };
 
-        let alg = match signing_alg_from_sign1(&sign1) {
-            Ok(a) => a,
-            Err(_) => {
+        let alg = match signing_alg_from_cose_key(&key.key) {
+            Some(a) => a,
+            None => {
                 return fail_validation(
-                    "signerBinding COSE_Sign1 has unsupported or missing algorithm",
+                    "signerBinding: unsupported or missing algorithm in session COSE_Key",
                     LIVEVIDEO_SESSIONKEY_INVALID,
                     tracker,
                 );
             }
         };
 
-        let spki_der = match spki_der_from_cert(ee_cert_der) {
-            Some(spki) => spki,
+        let session_public_key_der = match cose_key_to_der(&key.key) {
+            Some(der) => der,
             None => {
                 return fail_validation(
-                    "failed to extract public key from end-entity certificate",
+                    "failed to convert session COSE_Key to DER for signerBinding verification",
                     LIVEVIDEO_SESSIONKEY_INVALID,
                     tracker,
                 );
@@ -310,8 +314,18 @@ impl LiveVideoValidator {
             }
         };
 
-        let tbs = sign1.tbs_data(b"");
-        if let Err(e) = validator.validate(&sign1.signature, &tbs, &spki_der) {
+        let external_payload = c2pa_cbor::to_vec(&c2pa_cbor::Value::Bytes(ee_cert_der.to_vec()))
+            .map_err(|e| {
+                let _ = fail_validation(
+                    format!("failed to CBOR-encode EE certificate for signerBinding: {e}"),
+                    LIVEVIDEO_SESSIONKEY_INVALID,
+                    tracker,
+                );
+                Error::BadParam("livevideo.sessionkey.invalid".into())
+            })?;
+
+        let tbs = sign1.tbs_data(&external_payload);
+        if let Err(e) = validator.validate(&sign1.signature, &tbs, &session_public_key_der) {
             return fail_validation(
                 format!("signerBinding signature verification failed: {e}"),
                 LIVEVIDEO_SESSIONKEY_INVALID,
@@ -321,14 +335,6 @@ impl LiveVideoValidator {
 
         Ok(())
     }
-}
-
-fn spki_der_from_cert(cert_der: &[u8]) -> Option<Vec<u8>> {
-    use asn1_rs::FromDer;
-    use x509_parser::prelude::X509Certificate;
-
-    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
-    Some(cert.public_key().raw.to_vec())
 }
 
 /// Extracts raw bytes from a `signerBinding` CBOR value.
@@ -772,37 +778,62 @@ mod tests {
             .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID) }));
     }
 
-    // ── signer_binding verification ────────────────────────────────────────────
+    // ── signer_binding verification (§18.25.2) ─────────────────────────────────
+    //
+    // Per the spec, signerBinding is a **detached** COSE_Sign1 where the session
+    // key signs the signer's EE certificate (as CBOR byte string).
 
-    fn make_signer_binding_cose(signer: &dyn crate::Signer) -> Vec<u8> {
+    fn generate_ed25519_session_key() -> ed25519_dalek::SigningKey {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    }
+
+    fn build_ed25519_cose_key_value(
+        verifying_key: &ed25519_dalek::VerifyingKey,
+        kid: &[u8],
+    ) -> c2pa_cbor::Value {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(cbor_int(1), cbor_int(1)); // kty: OKP
+        map.insert(cbor_int(2), c2pa_cbor::Value::Bytes(kid.to_vec())); // kid
+        map.insert(cbor_int(-1), cbor_int(6)); // crv: Ed25519
+        map.insert(
+            cbor_int(-2),
+            c2pa_cbor::Value::Bytes(verifying_key.as_bytes().to_vec()),
+        ); // x
+        c2pa_cbor::Value::Map(map)
+    }
+
+    fn make_signer_binding_for_ee_cert(
+        session_signing_key: &ed25519_dalek::SigningKey,
+        ee_cert_der: &[u8],
+    ) -> Vec<u8> {
         use coset::{iana, HeaderBuilder, TaggedCborSerializable};
+        use ed25519_dalek::Signer;
+
+        let external_payload =
+            c2pa_cbor::to_vec(&c2pa_cbor::Value::Bytes(ee_cert_der.to_vec())).unwrap();
 
         let protected = HeaderBuilder::new()
             .algorithm(iana::Algorithm::EdDSA)
             .build();
         let mut sign1 = coset::CoseSign1Builder::new()
             .protected(protected)
-            .payload(b"session-key-binding".to_vec())
             .build();
-        let tbs = sign1.tbs_data(b"");
-        sign1.signature = signer.sign(&tbs).unwrap();
+
+        let tbs = sign1.tbs_data(&external_payload);
+        let sig: ed25519_dalek::Signature = session_signing_key.sign(&tbs);
+        sign1.signature = sig.to_bytes().to_vec();
         sign1.to_tagged_vec().unwrap()
     }
 
-    fn session_key_with_binding(binding_bytes: Vec<u8>) -> SessionKeys {
-        let mut key_map = std::collections::BTreeMap::new();
-        key_map.insert(cbor_int(1), cbor_int(2)); // kty: EC2
-        key_map.insert(
-            cbor_int(2),
-            c2pa_cbor::Value::Bytes(b"k".to_vec()),
-        ); // kid
-        key_map.insert(cbor_int(-1), cbor_int(1)); // crv: P-256
-        key_map.insert(cbor_int(-2), c2pa_cbor::Value::Bytes(vec![0; 32]));
-        key_map.insert(cbor_int(-3), c2pa_cbor::Value::Bytes(vec![0; 32]));
-
+    fn session_key_with_ed25519_binding(
+        cose_key: c2pa_cbor::Value,
+        binding_bytes: Vec<u8>,
+    ) -> SessionKeys {
         SessionKeys {
             keys: vec![SessionKey {
-                key: c2pa_cbor::Value::Map(key_map),
+                key: cose_key,
                 min_sequence_number: 0,
                 created_at: DateT(chrono::Utc::now().to_rfc3339()),
                 validity_period: 3600,
@@ -818,8 +849,11 @@ mod tests {
         )
         .unwrap();
         let ee_cert_der = signer.cert_chain_der[0].clone();
-        let binding = make_signer_binding_cose(&signer);
-        let keys = session_key_with_binding(binding);
+
+        let session_key = generate_ed25519_session_key();
+        let cose_key = build_ed25519_cose_key_value(&session_key.verifying_key(), b"k");
+        let binding = make_signer_binding_for_ee_cert(&session_key, &ee_cert_der);
+        let keys = session_key_with_ed25519_binding(cose_key, binding);
 
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
@@ -843,12 +877,13 @@ mod tests {
         .unwrap();
         let ee_cert_der = signer.cert_chain_der[0].clone();
 
-        let other_signer = crate::utils::ephemeral_signer::EphemeralSigner::new(
-            "other.local",
-        )
-        .unwrap();
-        let binding = make_signer_binding_cose(&other_signer);
-        let keys = session_key_with_binding(binding);
+        let session_key = generate_ed25519_session_key();
+        let cose_key = build_ed25519_cose_key_value(&session_key.verifying_key(), b"k");
+
+        // Sign with a *different* session key — binding won't match the `key` field
+        let other_session_key = generate_ed25519_session_key();
+        let binding = make_signer_binding_for_ee_cert(&other_session_key, &ee_cert_der);
+        let keys = session_key_with_ed25519_binding(cose_key, binding);
 
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
@@ -862,7 +897,9 @@ mod tests {
 
     #[test]
     fn signer_binding_none_cert_skips_verification() {
-        let keys = session_key_with_binding(vec![0xDE, 0xAD]);
+        let session_key = generate_ed25519_session_key();
+        let cose_key = build_ed25519_cose_key_value(&session_key.verifying_key(), b"k");
+        let keys = session_key_with_ed25519_binding(cose_key, vec![0xDE, 0xAD]);
 
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
