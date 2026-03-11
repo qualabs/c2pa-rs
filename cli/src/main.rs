@@ -285,6 +285,19 @@ enum Commands {
         /// Used to resume the continuity chain across separate process runs.
         #[arg(long = "previous-segment")]
         previous_segment: Option<PathBuf>,
+
+        /// Signing method to use: "manifest" (§19.3, default) or "vsi" (§19.4).
+        ///
+        /// - manifest: each segment carries its own C2PA Manifest Box.
+        /// - vsi: each segment carries a COSE_Sign1 emsg box; the init segment is required.
+        #[arg(long = "method", default_value = "manifest")]
+        method: String,
+
+        /// Path to an Ed25519 session key file (raw 32-byte seed).
+        /// Required when using --method vsi. The same key must be used across all
+        /// invocations for a given live video session.
+        #[arg(long = "session-key")]
+        session_key: Option<PathBuf>,
     },
 }
 
@@ -744,6 +757,8 @@ fn main() -> Result<()> {
         manifest,
         init,
         previous_segment,
+        method,
+        session_key,
     }) = &args.command
     {
         let manifest_json = std::fs::read_to_string(manifest)
@@ -754,6 +769,32 @@ fn main() -> Result<()> {
             Err(Error::MissingSignerSettings) => sign_config.signer()?,
             Err(err) => return Err(err.into()),
         };
+
+        if method == "vsi" {
+            let init_path = match init.as_deref() {
+                Some(p) => {
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        args.path.join(p)
+                    }
+                }
+                None => bail!("--init is required when using --method vsi"),
+            };
+            let session_key_path = session_key.as_deref()
+                .ok_or_else(|| anyhow!("--session-key is required when using --method vsi"))?;
+            return live_video_sign::sign_live_video_vsi(
+                &args.path,
+                segments_glob,
+                &init_path,
+                previous_segment.as_deref(),
+                &manifest_json,
+                output,
+                session_key_path,
+                signer.as_ref(),
+            );
+        }
+
         let init_path = init.as_deref().map(|p| {
             if p.is_absolute() {
                 p.to_path_buf()
