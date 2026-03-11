@@ -11,7 +11,7 @@
 // specific language governing permissions and limitations under
 // each license.
 
-//! Support for C2PA Live Video validation (section 19 of the C2PA Technical Specification).
+//! Support for C2PA Live Video signing and validation (section 19 of the C2PA Technical Specification).
 //!
 //! Implements two validation methods:
 //!
@@ -23,12 +23,25 @@
 //!   an `emsg` box. Use [`LiveVideoValidator::validate_session_keys`] and
 //!   [`LiveVideoValidator::validate_verifiable_segment_info`].
 //!
+//! # Signing
+//!
+//! Use [`LiveVideoSigner`] to sign an init segment and a sequence of media segments.
+//!
+//! # Validation
+//!
+//! Use [`LiveVideoValidator`] to validate a signed live video stream.
+//!
 //! See [C2PA Technical Specification — Live Video](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_live_video).
 
 pub(crate) mod cose_key;
 mod segment_manifest_validation;
 mod session_key_validation;
 pub mod verifiable_segment_info;
+mod signing;
+
+pub use signing::LiveVideoSigner;
+
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use crate::{
     assertions::{LiveVideoSegment, SessionKey, SessionKeys},
