@@ -195,7 +195,7 @@ pub fn sign_live_video_vsi(
             .with_context(|| format!("Failed to resume from segment: {prev_path:?}"))?;
     }
 
-    sign_vsi_init_segment(init_path, output_dir, &vsi_signer, signer)?;
+    sign_vsi_init_segment(init_path, output_dir, &mut vsi_signer, signer)?;
 
     let segment_paths = collect_segments(segments_dir, segments_glob)?;
 
@@ -237,7 +237,7 @@ pub fn sign_live_video_vsi(
 fn sign_vsi_init_segment(
     init_path: &Path,
     output_dir: &Path,
-    vsi_signer: &LiveVideoVsiSigner,
+    vsi_signer: &mut LiveVideoVsiSigner,
     signer: &dyn Signer,
 ) -> Result<()> {
     let init_data = fs::read(init_path)

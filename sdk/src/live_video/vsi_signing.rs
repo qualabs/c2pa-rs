@@ -26,12 +26,12 @@ use coset::{iana, CoseSign1Builder, HeaderBuilder, TaggedCborSerializable};
 use ed25519_dalek::{Signer as Ed25519Signer, SigningKey, VerifyingKey};
 
 use crate::{
-    assertions::{SessionKey, SessionKeys},
+    assertions::{BmffHash, DataMap, ExclusionsMap, SessionKey, SessionKeys},
     builder::Builder,
     cbor_types::DateT,
     error::{Error, Result},
     live_video::verifiable_segment_info::SegmentInfoMap,
-    Signer,
+    Reader, Signer,
 };
 
 const VSI_SCHEME_ID_URI: &str = "urn:c2pa:verifiable-segment-info";
@@ -59,6 +59,10 @@ pub struct LiveVideoVsiSigner {
     validity_period: u64,
     next_sequence_number: u64,
     base_manifest_json: String,
+    /// Instance ID of the active manifest from the signed init segment.
+    /// Populated by `sign_init_segment` and embedded in every media segment's
+    /// `segment-info-map` as `manifestId` per §19.4.
+    active_manifest_id: Option<String>,
 }
 
 impl LiveVideoVsiSigner {
@@ -114,14 +118,21 @@ impl LiveVideoVsiSigner {
             validity_period: validity_period_secs,
             next_sequence_number: min_sequence_number,
             base_manifest_json,
+            active_manifest_id: None,
         })
     }
 
     /// Signs an init segment, embedding a `c2pa.session-keys` assertion.
     ///
+    /// Captures the manifest instance ID from the signed output so that
+    /// subsequent calls to [`sign_media_segment`] can embed it as `manifestId`
+    /// per §19.4.
+    ///
     /// Per §19.2.3, the init segment SHOULD NOT contain media data (`mdat`).
+    ///
+    /// [`sign_media_segment`]: LiveVideoVsiSigner::sign_media_segment
     pub fn sign_init_segment(
-        &self,
+        &mut self,
         segment_data: &[u8],
         format: &str,
         manifest_signer: &dyn Signer,
@@ -133,18 +144,30 @@ impl LiveVideoVsiSigner {
         let mut source = std::io::Cursor::new(segment_data);
         let mut dest = std::io::Cursor::new(Vec::new());
         builder.sign(manifest_signer, format, &mut source, &mut dest)?;
-        Ok(dest.into_inner())
+        let signed_bytes = dest.into_inner();
+
+        // Capture the manifest ID so media segments can reference it as `manifestId`.
+        let reader = Reader::from_stream(format, std::io::Cursor::new(&signed_bytes))?;
+        if let Some(manifest) = reader.active_manifest() {
+            self.active_manifest_id = Some(manifest.instance_id().to_string());
+        }
+
+        Ok(signed_bytes)
     }
 
     /// Signs a media segment by prepending a COSE_Sign1 `emsg` box.
     ///
     /// The COSE_Sign1 payload is a CBOR `SegmentInfoMap` with the current
-    /// sequence number.  The box is signed with the session Ed25519 key.
+    /// sequence number, a `bmffHash` covering the segment data excluding VSI
+    /// `emsg` boxes, and the `manifestId` from the signed init segment per §19.4.
     pub fn sign_media_segment(&mut self, segment_data: &[u8]) -> Result<Vec<u8>> {
+        let bmff_hash = build_segment_bmff_hash(segment_data)?;
+        let manifest_id = self.active_manifest_id.clone().unwrap_or_default();
+
         let segment_info_map = SegmentInfoMap {
             sequence_number: self.next_sequence_number,
-            bmff_hash: c2pa_cbor::Value::Null,
-            manifest_id: String::new(),
+            bmff_hash,
+            manifest_id,
             manifest_uri: None,
         };
 
@@ -191,6 +214,41 @@ impl LiveVideoVsiSigner {
             }],
         }
     }
+}
+
+// ── BMFF hash helper ─────────────────────────────────────────────────────────
+
+/// Computes the `bmff-hash-map` for a media segment per §19.4.1.
+///
+/// The hash covers the entire segment excluding any VSI `emsg` boxes, identified
+/// by their `scheme_id_uri` field ("urn:c2pa:verifiable-segment-info").  The
+/// exclusion `offset` is 12 because in an ISO BMFF `emsg` box the
+/// `scheme_id_uri` string starts at byte 12 from the box start (8-byte BMFF
+/// header + 4-byte FullBox version/flags header).
+///
+/// `bmff_version` is forced to 0 to match what the validator sees after a
+/// CBOR round-trip, since `BmffHash::bmff_version` is `#[serde(skip)]` and
+/// therefore deserializes as 0.
+fn build_segment_bmff_hash(segment_data: &[u8]) -> Result<c2pa_cbor::Value> {
+    const VSI_URI_OFFSET_IN_EMSG: u64 = 12;
+
+    let mut bmff_hash = BmffHash::new("", "sha256", None);
+    bmff_hash.set_bmff_version(0);
+
+    let mut vsi_emsg_exclusion = ExclusionsMap::new("/emsg".to_string());
+    vsi_emsg_exclusion.data = Some(vec![DataMap {
+        offset: VSI_URI_OFFSET_IN_EMSG,
+        value: VSI_SCHEME_ID_URI.as_bytes().to_vec(),
+    }]);
+    bmff_hash.add_exclusions(&mut vec![vsi_emsg_exclusion]);
+
+    let mut cursor = std::io::Cursor::new(segment_data);
+    bmff_hash
+        .gen_hash_from_stream(&mut cursor)
+        .map_err(|e| Error::BadParam(format!("failed to compute segment bmffHash: {e}")))?;
+
+    c2pa_cbor::value::to_value(&bmff_hash)
+        .map_err(|e| Error::BadParam(format!("failed to serialize bmffHash to CBOR: {e}")))
 }
 
 // ── Ed25519 helpers ──────────────────────────────────────────────────────────
@@ -476,6 +534,62 @@ mod tests {
         let mut resumed_signer = make_vsi_signer(&signer, b"k", 1);
         resumed_signer.resume_from_segment(&seg1).unwrap();
         assert_eq!(resumed_signer.next_sequence_number(), 2);
+    }
+
+    #[test]
+    fn sign_media_segment_bmff_hash_is_not_null() {
+        use crate::live_video::verifiable_segment_info::parse_segment_info_map;
+
+        let signer = make_test_signer();
+        let mut vsi_signer = make_vsi_signer(&signer, b"k", 1);
+
+        let signed = vsi_signer.sign_media_segment(&make_test_segment()).unwrap();
+        let vsi_bytes = extract_vsi_payload_from_segment(&signed).unwrap();
+        let info_map = parse_segment_info_map(&vsi_bytes).unwrap();
+
+        assert!(
+            !info_map.bmff_hash.is_null(),
+            "bmffHash must not be null per §19.4 — regression guard"
+        );
+    }
+
+    #[test]
+    fn sign_media_segment_manifest_id_empty_without_init() {
+        use crate::live_video::verifiable_segment_info::parse_segment_info_map;
+
+        let signer = make_test_signer();
+        let mut vsi_signer = make_vsi_signer(&signer, b"k", 1);
+
+        let signed = vsi_signer.sign_media_segment(&make_test_segment()).unwrap();
+        let vsi_bytes = extract_vsi_payload_from_segment(&signed).unwrap();
+        let info_map = parse_segment_info_map(&vsi_bytes).unwrap();
+
+        // When sign_init_segment has not been called, manifest_id defaults to empty.
+        assert_eq!(info_map.manifest_id, "");
+    }
+
+    #[test]
+    fn sign_media_segment_manifest_id_populated_after_signing_init() {
+        use crate::live_video::verifiable_segment_info::parse_segment_info_map;
+
+        // Use a real DASH init segment so Builder::sign can embed the manifest.
+        let init_data = include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
+
+        let signer = make_test_signer();
+        let mut vsi_signer = make_vsi_signer(&signer, b"k", 1);
+
+        vsi_signer
+            .sign_init_segment(init_data, "video/mp4", &signer)
+            .unwrap();
+
+        let signed = vsi_signer.sign_media_segment(&make_test_segment()).unwrap();
+        let vsi_bytes = extract_vsi_payload_from_segment(&signed).unwrap();
+        let info_map = parse_segment_info_map(&vsi_bytes).unwrap();
+
+        assert!(
+            !info_map.manifest_id.is_empty(),
+            "manifestId must be populated from the signed init segment per §19.4"
+        );
     }
 
     #[test]
