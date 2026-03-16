@@ -147,9 +147,16 @@ impl LiveVideoVsiSigner {
         let signed_bytes = dest.into_inner();
 
         // Capture the manifest ID so media segments can reference it as `manifestId`.
+        // c2pa-rs stores instance IDs as "xmp:iid:{uuid}"; convert to the canonical
+        // "urn:uuid:{uuid}" form required by the C2PA VSI spec §19.4.
         let reader = Reader::from_stream(format, std::io::Cursor::new(&signed_bytes))?;
         if let Some(manifest) = reader.active_manifest() {
-            self.active_manifest_id = Some(manifest.instance_id().to_string());
+            let raw_id = manifest.instance_id();
+            let canonical_id = raw_id
+                .strip_prefix("xmp:iid:")
+                .map(|uuid| format!("urn:uuid:{uuid}"))
+                .unwrap_or_else(|| raw_id.to_string());
+            self.active_manifest_id = Some(canonical_id);
         }
 
         Ok(signed_bytes)
@@ -232,7 +239,7 @@ impl LiveVideoVsiSigner {
 fn build_segment_bmff_hash(segment_data: &[u8]) -> Result<c2pa_cbor::Value> {
     const VSI_URI_OFFSET_IN_EMSG: u64 = 12;
 
-    let mut bmff_hash = BmffHash::new("", "sha256", None);
+    let mut bmff_hash = BmffHash::new("jumbf manifest", "sha256", None);
     bmff_hash.set_bmff_version(0);
 
     let mut vsi_emsg_exclusion = ExclusionsMap::new("/emsg".to_string());
