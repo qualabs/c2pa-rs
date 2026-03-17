@@ -61,7 +61,7 @@ const ORIGINAL: &str = "original";
 const UPDATE: &str = "update";
 
 // ISO IEC 14496-12_2022 FullBoxes
-const FULL_BOX_TYPES: &[&str; 80] = &[
+const FULL_BOX_TYPES: &[&str; 81] = &[
     "pdin", "mvhd", "tkhd", "mdhd", "hdlr", "nmhd", "elng", "stsd", "stdp", "stts", "ctts", "cslg",
     "stss", "stsh", "stdp", "elst", "dref", "stsz", "stz2", "stsc", "stco", "co64", "padb", "subs",
     "saiz", "saio", "mehd", "trex", "mfhd", "tfhd", "trun", "tfra", "mfro", "tfdt", "leva", "trep",
@@ -69,6 +69,8 @@ const FULL_BOX_TYPES: &[&str; 80] = &[
     "ipro", "infe", "iinf", "iref", "ipma", "schm", "fiin", "fpar", "fecr", "gitn", "fire", "stri",
     "stsg", "stvi", "csch", "sidx", "ssix", "prft", "srpp", "vmhd", "smhd", "srat", "chnl", "dmix",
     "txtC", "mime", "uri ", "uriI", "hmhd", "sthd", "vvhd", "medc",
+    // ISO BMFF EventMessageBox (MPEG-DASH): version(1) + flags(3) follow the 8-byte header
+    "emsg",
 ];
 
 static SUPPORTED_TYPES: [&str; 16] = [
@@ -664,9 +666,23 @@ where
                 if let Some(data_map_vec) = &bmff_exclusion.data {
                     let mut should_add = true;
 
+                    // For standard FullBox types the `data-map` offset convention is
+                    // relative to the FullBox payload (after the 8-byte BMFF header and
+                    // the 4-byte version/flags), so we advance the base by 12 bytes.
+                    // UUID boxes are explicitly excluded because their extended_type
+                    // field precedes the FullBox version/flags, so their offset is
+                    // relative to the absolute box start (UUID is not in FULL_BOX_TYPES).
+                    const FULLBOX_HEADER_SIZE: u64 = 12; // 8-byte BMFF header + 4-byte version/flags
+                    let data_comparison_base =
+                        if FULL_BOX_TYPES.contains(&box_info.path.as_str()) {
+                            box_start + FULLBOX_HEADER_SIZE
+                        } else {
+                            box_start
+                        };
+
                     for data_map in data_map_vec {
                         // move to the start of exclusion
-                        skip_bytes_to(reader, box_start + data_map.offset)?;
+                        skip_bytes_to(reader, data_comparison_base + data_map.offset)?;
 
                         // match the data
                         let buf = reader.read_to_vec(data_map.value.len() as u64)?;

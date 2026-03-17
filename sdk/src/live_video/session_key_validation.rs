@@ -166,21 +166,48 @@ impl LiveVideoValidator {
             return Ok(());
         }
 
-        let bmff_hash: crate::assertions::BmffHash =
-            match c2pa_cbor::value::from_value(bmff_hash_value.clone()) {
+        let bmff_cbor_bytes = match c2pa_cbor::to_vec(&bmff_hash_value.clone()) {
+            Ok(b) => b,
+            Err(e) => {
+                return fail_validation(
+                    format!("failed to re-encode bmffHash value: {e}"),
+                    LIVEVIDEO_SEGMENT_INVALID,
+                    tracker,
+                );
+            }
+        };
+        let mut bmff_hash: crate::assertions::BmffHash =
+            match c2pa_cbor::from_slice(&bmff_cbor_bytes) {
                 Ok(h) => h,
                 Err(e) => {
                     return fail_validation(
-                        format!("failed to deserialize bmffHash from segment-info-map: {e}"),
+                        format!(
+                            "bmffHash in segment-info-map is not spec-compliant \
+                             (C2PA spec §18.6 CDDL): {e}. \
+                             Each exclusion-map 'data' field must be a CBOR array \
+                             ([* data-map]); encoding a single data-map object \
+                             without an enclosing array is invalid per spec."
+                        ),
                         LIVEVIDEO_SEGMENT_INVALID,
                         tracker,
                     );
                 }
             };
 
+        // bmff_version is #[serde(skip)] so always deserializes to 0; set V2
+        // to match the hash format used when signing (absolute file offsets are
+        // injected per box per the V2 algorithm).
+        bmff_hash.set_bmff_version(2);
+
         if let Err(e) = bmff_hash.verify_in_memory_hash(segment_data, None) {
             return fail_validation(
-                format!("segment bmffHash verification failed: {e}"),
+                format!(
+                    "segment bmffHash verification failed (C2PA spec §19.4.1): {e}. \
+                     The emsg exclusion-map must have xpath=\"/emsg\", offset=0, and \
+                     value=\"urn:c2pa:verifiable-segment-info\". The offset is relative \
+                     to the FullBox payload start (i.e., after the 12-byte combined header: \
+                     8-byte BMFF box header + 4-byte version/flags field)."
+                ),
                 LIVEVIDEO_SEGMENT_INVALID,
                 tracker,
             );

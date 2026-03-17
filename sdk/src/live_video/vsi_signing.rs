@@ -167,10 +167,34 @@ impl LiveVideoVsiSigner {
     /// The COSE_Sign1 payload is a CBOR `SegmentInfoMap` with the current
     /// sequence number, a `bmffHash` covering the segment data excluding VSI
     /// `emsg` boxes, and the `manifestId` from the signed init segment per §19.4.
+    /// Signs a media segment by prepending a COSE_Sign1 `emsg` box.
+    ///
+    /// Uses a two-pass approach to ensure the BmffHash V2 (which injects each
+    /// box's absolute file offset into the digest) uses correct offsets:
+    ///
+    /// 1. Build a provisional emsg with a placeholder hash (same CBOR size as the
+    ///    real hash) to determine the emsg box size.
+    /// 2. Compute the V2 hash of `[provisional_emsg][segment_data]` with the emsg
+    ///    box excluded — this captures the final absolute offsets.
+    /// 3. Build the real emsg with the actual hash (guaranteed same size).
     pub fn sign_media_segment(&mut self, segment_data: &[u8]) -> Result<Vec<u8>> {
-        let bmff_hash = build_segment_bmff_hash(segment_data)?;
         let manifest_id = self.active_manifest_id.clone().unwrap_or_default();
 
+        // Pass 1: build provisional emsg to establish absolute box offsets.
+        let provisional_emsg = build_provisional_emsg(
+            self.next_sequence_number,
+            &manifest_id,
+            segment_data,
+            &self.session_signing_key,
+            &self.kid,
+        )?;
+        let mut provisional_signed = provisional_emsg.clone();
+        provisional_signed.extend_from_slice(segment_data);
+
+        // Pass 2: compute V2 hash of the provisional signed segment with emsg
+        // excluded. Because provisional and final emsg boxes have the same size,
+        // this hash is valid for the final signed segment as well.
+        let bmff_hash = build_segment_bmff_hash(&provisional_signed)?;
         let segment_info_map = SegmentInfoMap {
             sequence_number: self.next_sequence_number,
             bmff_hash,
@@ -178,8 +202,15 @@ impl LiveVideoVsiSigner {
             manifest_uri: None,
         };
 
-        let cose_sign1_bytes = build_vsi_cose_sign1(&segment_info_map, &self.session_signing_key, &self.kid)?;
+        let cose_sign1_bytes =
+            build_vsi_cose_sign1(&segment_info_map, &self.session_signing_key, &self.kid)?;
         let emsg_box = build_emsg_box(&cose_sign1_bytes);
+
+        debug_assert_eq!(
+            emsg_box.len(),
+            provisional_emsg.len(),
+            "provisional and final emsg sizes must match for V2 hash offsets to remain valid"
+        );
 
         let mut signed_segment = emsg_box;
         signed_segment.extend_from_slice(segment_data);
@@ -237,10 +268,15 @@ impl LiveVideoVsiSigner {
 /// CBOR round-trip, since `BmffHash::bmff_version` is `#[serde(skip)]` and
 /// therefore deserializes as 0.
 fn build_segment_bmff_hash(segment_data: &[u8]) -> Result<c2pa_cbor::Value> {
-    const VSI_URI_OFFSET_IN_EMSG: u64 = 12;
+    // The data-map offset is relative to the FullBox payload (after the 12-byte emsg header),
+    // which is the convention expected by bmff_to_jumbf_exclusions for FULL_BOX_TYPES.
+    const VSI_URI_OFFSET_IN_EMSG: u64 = 0;
 
     let mut bmff_hash = BmffHash::new("jumbf manifest", "sha256", None);
-    bmff_hash.set_bmff_version(0);
+    // Use BmffHash V2 (bmff_version > 1): each top-level box contributes a big-endian
+    // 8-byte file offset followed by its bytes.  This matches the hash format used by
+    // reference implementations of C2PA §19.4.
+    bmff_hash.set_bmff_version(2);
 
     let mut vsi_emsg_exclusion = ExclusionsMap::new("/emsg".to_string());
     vsi_emsg_exclusion.data = Some(vec![DataMap {
@@ -256,6 +292,34 @@ fn build_segment_bmff_hash(segment_data: &[u8]) -> Result<c2pa_cbor::Value> {
 
     c2pa_cbor::value::to_value(&bmff_hash)
         .map_err(|e| Error::BadParam(format!("failed to serialize bmffHash to CBOR: {e}")))
+}
+
+/// Builds a provisional emsg box with a placeholder hash for the given segment.
+///
+/// The provisional emsg has the **same byte length** as the final emsg because
+/// SHA-256 hashes are always 32 bytes and the rest of the CBOR encoding is
+/// identical.  This allows the caller to compute V2 BmffHash offsets on
+/// `[provisional_emsg][segment_data]` and then substitute the real hash
+/// without changing any box boundary.
+fn build_provisional_emsg(
+    sequence_number: u64,
+    manifest_id: &str,
+    segment_data: &[u8],
+    signing_key: &SigningKey,
+    kid: &[u8],
+) -> Result<Vec<u8>> {
+    // Use the original segment (no emsg yet) to compute a V2 hash.  The hash
+    // value will differ from the final one (offsets shift once emsg is prepended),
+    // but its CBOR encoding size is identical, so the emsg length is stable.
+    let provisional_bmff_hash = build_segment_bmff_hash(segment_data)?;
+    let info_map = SegmentInfoMap {
+        sequence_number,
+        bmff_hash: provisional_bmff_hash,
+        manifest_id: manifest_id.to_string(),
+        manifest_uri: None,
+    };
+    let cose = build_vsi_cose_sign1(&info_map, signing_key, kid)?;
+    Ok(build_emsg_box(&cose))
 }
 
 // ── Ed25519 helpers ──────────────────────────────────────────────────────────
