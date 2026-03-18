@@ -319,7 +319,9 @@ fn build_signer_binding(
         .protected(protected)
         .build();
 
-    let tbs = sign1.tbs_data(&external_payload);
+    // signerBinding is a detached-payload COSE_Sign1: the cert bytes are the
+    // external payload, not AAD. Use tbs_detached_data per RFC 9052 §4.4.
+    let tbs = sign1.tbs_detached_data(&external_payload, b"");
     let signature: ed25519_dalek::Signature = Ed25519Signer::sign(session_signing_key, &tbs);
     sign1.signature = signature.to_bytes().to_vec();
 

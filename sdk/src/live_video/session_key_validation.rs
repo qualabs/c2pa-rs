@@ -324,7 +324,9 @@ impl LiveVideoValidator {
                 Error::BadParam("livevideo.sessionkey.invalid".into())
             })?;
 
-        let tbs = sign1.tbs_data(&external_payload);
+        // signerBinding is a detached-payload COSE_Sign1: the cert bytes are the
+        // external payload, not AAD. Use tbs_detached_data per RFC 9052 §4.4.
+        let tbs = sign1.tbs_detached_data(&external_payload, b"");
         if let Err(e) = validator.validate(&sign1.signature, &tbs, &session_public_key_der) {
             return fail_validation(
                 format!("signerBinding signature verification failed: {e}"),
@@ -821,7 +823,7 @@ mod tests {
             .protected(protected)
             .build();
 
-        let tbs = sign1.tbs_data(&external_payload);
+        let tbs = sign1.tbs_detached_data(&external_payload, b"");
         let sig: ed25519_dalek::Signature = session_signing_key.sign(&tbs);
         sign1.signature = sig.to_bytes().to_vec();
         sign1.to_tagged_vec().unwrap()
