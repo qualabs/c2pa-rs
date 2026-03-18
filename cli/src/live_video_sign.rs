@@ -188,14 +188,32 @@ pub fn sign_live_video_vsi(
     .context("Failed to initialize VSI signer")?;
 
     if let Some(prev_path) = previous_segment_path {
+        // Resuming an existing session: restore state from previously signed outputs.
+        // Re-signing the init would produce a new UUID, breaking manifestId continuity
+        // across segments per §19.4.
         let prev_data = fs::read(prev_path)
             .with_context(|| format!("Failed to read previous segment: {prev_path:?}"))?;
         vsi_signer
             .resume_from_segment(&prev_data)
             .with_context(|| format!("Failed to resume from segment: {prev_path:?}"))?;
-    }
 
-    sign_vsi_init_segment(init_path, output_dir, &mut vsi_signer, signer)?;
+        let signed_init_path = output_path_for(init_path, output_dir)?;
+        let signed_init_data = fs::read(&signed_init_path).with_context(|| {
+            format!(
+                "Failed to read signed init segment from output dir: {signed_init_path:?}. \
+                 Run without --previous-segment first to sign the init segment."
+            )
+        })?;
+        let format = format_from_path(init_path).unwrap_or_else(|| "video/mp4".to_string());
+        vsi_signer
+            .restore_manifest_id_from_signed_init(&signed_init_data, &format)
+            .with_context(|| {
+                format!("Failed to restore manifest ID from signed init: {signed_init_path:?}")
+            })?;
+    } else {
+        // First invocation: sign the init segment and capture its manifest ID.
+        sign_vsi_init_segment(init_path, output_dir, &mut vsi_signer, signer)?;
+    }
 
     let segment_paths = collect_segments(segments_dir, segments_glob)?;
 
