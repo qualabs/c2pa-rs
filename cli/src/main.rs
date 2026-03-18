@@ -283,6 +283,10 @@ enum Commands {
 
         /// Optional path to the last signed media segment from a previous invocation.
         /// Used to resume the continuity chain across separate process runs.
+        ///
+        /// When using --method vsi, providing this flag skips re-signing the init segment.
+        /// The already-signed init must be present in the output directory (written by the
+        /// first invocation). This preserves the same manifestId across all segments.
         #[arg(long = "previous-segment")]
         previous_segment: Option<PathBuf>,
 

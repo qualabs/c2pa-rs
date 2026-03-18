@@ -193,6 +193,29 @@ impl LiveVideoVsiSigner {
         self.next_sequence_number
     }
 
+    /// Restores the active manifest ID from a previously signed init segment.
+    ///
+    /// Used when resuming a live session across process invocations.  Re-signing
+    /// the init would produce a different UUID, breaking `manifestId` continuity
+    /// across segments.  Instead, call this method with the already-signed init
+    /// from the output directory to restore the session's `manifestId`.
+    pub fn restore_manifest_id_from_signed_init(
+        &mut self,
+        signed_init_data: &[u8],
+        format: &str,
+    ) -> Result<()> {
+        let reader = Reader::from_stream(format, std::io::Cursor::new(signed_init_data))?;
+        if let Some(manifest) = reader.active_manifest() {
+            let raw_id = manifest.instance_id();
+            let canonical_id = raw_id
+                .strip_prefix("xmp:iid:")
+                .map(|uuid| format!("urn:uuid:{uuid}"))
+                .unwrap_or_else(|| raw_id.to_string());
+            self.active_manifest_id = Some(canonical_id);
+        }
+        Ok(())
+    }
+
     /// Resumes from a previously signed VSI segment.
     ///
     /// Extracts the `sequenceNumber` from the segment's `emsg` box and sets
@@ -653,5 +676,69 @@ mod tests {
             })
             .collect();
         assert!(failures.is_empty(), "validation failures: {failures:?}");
+    }
+
+    /// Regression test for the dynamic-manifestId bug: when the CLI is invoked once per
+    /// segment (live session), `sign_init_segment` must not be called again.
+    /// Instead, `restore_manifest_id_from_signed_init` must produce the same `manifestId`
+    /// as the original `sign_init_segment` call.
+    #[test]
+    fn restore_manifest_id_from_signed_init_matches_original_manifest_id() {
+        use crate::live_video::verifiable_segment_info::parse_segment_info_map;
+
+        let init_data = include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
+
+        let signer = make_test_signer();
+        let session_key = make_test_signing_key();
+
+        // Simulate first CLI invocation: sign init + seg_001.
+        let mut signer_call1 = LiveVideoVsiSigner::from_signing_key(
+            r#"{"assertions": []}"#,
+            &signer,
+            session_key.clone(),
+            b"k".to_vec(),
+            1,
+            3600,
+        )
+        .unwrap();
+        let signed_init = signer_call1
+            .sign_init_segment(init_data, "video/mp4", &signer)
+            .unwrap();
+        let seg1 = signer_call1.sign_media_segment(&make_test_segment()).unwrap();
+        let map1 = parse_segment_info_map(
+            &extract_vsi_payload_from_segment(&seg1).unwrap()
+        ).unwrap();
+
+        // Simulate second CLI invocation: new signer process, restore state.
+        let mut signer_call2 = LiveVideoVsiSigner::from_signing_key(
+            r#"{"assertions": []}"#,
+            &signer,
+            session_key.clone(),
+            b"k".to_vec(),
+            1,
+            3600,
+        )
+        .unwrap();
+        signer_call2.resume_from_segment(&seg1).unwrap();
+        signer_call2
+            .restore_manifest_id_from_signed_init(&signed_init, "video/mp4")
+            .unwrap();
+        let seg2 = signer_call2.sign_media_segment(&make_test_segment()).unwrap();
+        let map2 = parse_segment_info_map(
+            &extract_vsi_payload_from_segment(&seg2).unwrap()
+        ).unwrap();
+
+        // Both segments must reference the same manifestId.
+        assert_eq!(
+            map1.manifest_id, map2.manifest_id,
+            "manifestId must be identical across per-segment invocations (§19.4)"
+        );
+        assert!(
+            map2.manifest_id.starts_with("urn:uuid:"),
+            "manifestId must use urn:uuid: prefix, got: {}",
+            map2.manifest_id
+        );
+        assert_eq!(map1.sequence_number, 1);
+        assert_eq!(map2.sequence_number, 2);
     }
 }
