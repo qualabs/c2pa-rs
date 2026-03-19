@@ -339,14 +339,35 @@ impl LiveVideoValidator {
     }
 }
 
-/// Extracts raw bytes from a `signerBinding` CBOR value.
+/// Extracts raw COSE_Sign1_Tagged bytes from a `signerBinding` CBOR value.
 ///
 /// The value may appear in different forms depending on the serialization roundtrip:
-/// - `Value::Bytes` — direct CBOR byte string (ideal case)
+/// - `Value::Array` with 4 elements — COSE_Sign1 inner content, possibly from JSON roundtrip
+///   where byte strings become integer arrays. Re-serialized with tag 18.
+/// - `Value::Array` of integers — legacy: flat byte representation of tagged COSE_Sign1 bytes
+/// - `Value::Bytes` — direct CBOR byte string (ideal CBOR-only case)
 /// - `Value::Text` — base64-encoded string (serde_json with base64 for bytes)
-/// - `Value::Array` of integers — JSON array representation of bytes
 fn extract_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
     match value {
+        c2pa_cbor::Value::Array(items) if is_cose_sign1_array(items) => {
+            // COSE_Sign1 inner array [protected, unprotected, payload, signature].
+            // After a JSON roundtrip, bstr elements become integer arrays — coerce
+            // them back to Bytes so that the CBOR re-serialization is spec-correct.
+            let fixed = c2pa_cbor::Value::Array(
+                items.iter().map(coerce_int_array_to_bytes).collect(),
+            );
+            let mut buf = Vec::new();
+            c2pa_cbor::tags::encode_tagged(&mut buf, 18, &fixed).ok()?;
+            Some(buf)
+        }
+        // Legacy: flat array of integers (Value::Bytes after JSON roundtrip)
+        c2pa_cbor::Value::Array(items) => items
+            .iter()
+            .map(|v| match v {
+                c2pa_cbor::Value::Integer(i) => u8::try_from(*i).ok(),
+                _ => None,
+            })
+            .collect(),
         c2pa_cbor::Value::Bytes(bytes) => Some(bytes.clone()),
         c2pa_cbor::Value::Text(text) => {
             use base64::{engine::general_purpose, Engine};
@@ -355,21 +376,43 @@ fn extract_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
                 .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(text))
                 .ok()
         }
-        c2pa_cbor::Value::Array(items) => items
+        _ => None,
+    }
+}
+
+/// Returns true if the array looks like a COSE_Sign1 structure (4 elements
+/// where not all are plain integers).
+fn is_cose_sign1_array(items: &[c2pa_cbor::Value]) -> bool {
+    items.len() == 4
+        && items
+            .iter()
+            .any(|v| !matches!(v, c2pa_cbor::Value::Integer(_)))
+}
+
+/// If the value is an array of integers (from a JSON roundtrip of a CBOR bstr),
+/// convert it back to `Value::Bytes`. Otherwise return the value unchanged.
+fn coerce_int_array_to_bytes(value: &c2pa_cbor::Value) -> c2pa_cbor::Value {
+    if let c2pa_cbor::Value::Array(items) = value {
+        if let Some(bytes) = items
             .iter()
             .map(|v| match v {
                 c2pa_cbor::Value::Integer(i) => u8::try_from(*i).ok(),
                 _ => None,
             })
-            .collect(),
-        _ => None,
+            .collect::<Option<Vec<u8>>>()
+        {
+            return c2pa_cbor::Value::Bytes(bytes);
+        }
     }
+    value.clone()
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic)]
     #![allow(clippy::unwrap_used)]
+
+    use coset::TaggedCborSerializable;
 
     use super::super::{test_helpers::*, LiveVideoValidator};
     use crate::{
@@ -915,5 +958,106 @@ mod tests {
                 .map(|s| s.starts_with("livevideo"))
                 .unwrap_or(false)
         }));
+    }
+
+    #[test]
+    fn signer_binding_wrong_ee_cert_fails() {
+        let signer = crate::utils::ephemeral_signer::EphemeralSigner::new(
+            "test-binding.local",
+        )
+        .unwrap();
+        let ee_cert_der = signer.cert_chain_der[0].clone();
+
+        let session_key = generate_ed25519_session_key();
+        let cose_key = build_ed25519_cose_key_value(&session_key.verifying_key(), b"k");
+        let binding = make_signer_binding_for_ee_cert(&session_key, &ee_cert_der);
+        let keys = session_key_with_ed25519_binding(cose_key, binding);
+
+        // Validate with a different EE cert — signerBinding should fail
+        let other_signer = crate::utils::ephemeral_signer::EphemeralSigner::new(
+            "other-cert.local",
+        )
+        .unwrap();
+        let other_ee_cert = other_signer.cert_chain_der[0].clone();
+
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = aggregate_tracker();
+        let _ = validator.validate_session_keys(&keys, Some(&other_ee_cert), &mut tracker);
+
+        assert!(tracker
+            .logged_items()
+            .iter()
+            .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_SESSIONKEY_INVALID) }));
+    }
+
+    // ── COSE_Sign1 wire format tests (§18.25.2) ─────────────────────────────────
+
+    #[test]
+    fn signer_binding_is_cose_sign1_tagged() {
+        // Verify the COSE_Sign1 starts with CBOR tag 18 (0xD2)
+        let session_key = generate_ed25519_session_key();
+        let ee_cert_der = b"fake-cert-for-tag-test";
+        let binding_bytes = make_signer_binding_for_ee_cert(&session_key, ee_cert_der);
+
+        assert!(
+            !binding_bytes.is_empty(),
+            "binding bytes should not be empty"
+        );
+        assert_eq!(
+            binding_bytes[0], 0xD2,
+            "signerBinding must start with CBOR tag 18 (0xD2), got 0x{:02X}",
+            binding_bytes[0]
+        );
+    }
+
+    #[test]
+    fn signer_binding_payload_is_detached() {
+        // Per §18.25.2, the COSE_Sign1 payload must be null (detached)
+        let session_key = generate_ed25519_session_key();
+        let binding_bytes = make_signer_binding_for_ee_cert(&session_key, b"cert");
+
+        let sign1 = coset::CoseSign1::from_tagged_slice(&binding_bytes).unwrap();
+        assert!(
+            sign1.payload.is_none(),
+            "signerBinding payload must be None (detached), got {:?}",
+            sign1.payload
+        );
+    }
+
+    #[test]
+    fn signer_binding_protected_header_contains_algorithm() {
+        let session_key = generate_ed25519_session_key();
+        let binding_bytes = make_signer_binding_for_ee_cert(&session_key, b"cert");
+
+        let sign1 = coset::CoseSign1::from_tagged_slice(&binding_bytes).unwrap();
+        let alg = sign1.protected.header.alg;
+        assert_eq!(
+            alg,
+            Some(coset::RegisteredLabelWithPrivate::Assigned(
+                coset::iana::Algorithm::EdDSA
+            )),
+            "signerBinding protected header must contain alg = EdDSA"
+        );
+    }
+
+    #[test]
+    fn cose_key_contains_alg_field() {
+        // build_ed25519_cose_key must include field 3 (alg = -8 EdDSA) per RFC 9052
+        let session_key = generate_ed25519_session_key();
+        let key = super::super::vsi_signing::build_ed25519_cose_key(
+            &session_key.verifying_key(),
+            b"test-kid",
+        );
+
+        if let c2pa_cbor::Value::Map(map) = &key {
+            let alg_value = map.get(&c2pa_cbor::Value::Integer(3));
+            assert_eq!(
+                alg_value,
+                Some(&c2pa_cbor::Value::Integer(-8)),
+                "COSE_Key must contain field 3 (alg) = -8 (EdDSA)"
+            );
+        } else {
+            panic!("COSE_Key must be a CBOR map");
+        }
     }
 }

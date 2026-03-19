@@ -139,7 +139,7 @@ impl LiveVideoVsiSigner {
     ) -> Result<Vec<u8>> {
         let session_keys = self.build_session_keys_assertion();
         let mut builder = Builder::from_json(&self.base_manifest_json)?;
-        builder.add_assertion(SessionKeys::LABEL, &session_keys)?;
+        builder.add_assertion_cbor(SessionKeys::LABEL, &session_keys)?;
 
         let mut source = std::io::Cursor::new(segment_data);
         let mut dest = std::io::Cursor::new(Vec::new());
@@ -283,16 +283,18 @@ fn build_segment_bmff_hash(segment_data: &[u8]) -> Result<c2pa_cbor::Value> {
 
 // ── Ed25519 helpers ──────────────────────────────────────────────────────────
 
-fn build_ed25519_cose_key(verifying_key: &VerifyingKey, kid: &[u8]) -> c2pa_cbor::Value {
-    // OKP COSE_Key for Ed25519:
+pub(super) fn build_ed25519_cose_key(verifying_key: &VerifyingKey, kid: &[u8]) -> c2pa_cbor::Value {
+    // OKP COSE_Key for Ed25519 (RFC 9052):
     //   1 (kty)  → 1 (OKP)
     //   2 (kid)  → bytes
+    //   3 (alg)  → -8 (EdDSA)
     //  -1 (crv)  → 6 (Ed25519)
     //  -2 (x)   → public key bytes (32 bytes)
     let mut map = BTreeMap::new();
-    map.insert(c2pa_cbor::Value::Integer(1), c2pa_cbor::Value::Integer(1));  // kty: OKP
-    map.insert(c2pa_cbor::Value::Integer(2), c2pa_cbor::Value::Bytes(kid.to_vec()));  // kid
-    map.insert(c2pa_cbor::Value::Integer(-1), c2pa_cbor::Value::Integer(6)); // crv: Ed25519
+    map.insert(c2pa_cbor::Value::Integer(1), c2pa_cbor::Value::Integer(1));   // kty: OKP
+    map.insert(c2pa_cbor::Value::Integer(2), c2pa_cbor::Value::Bytes(kid.to_vec()));   // kid
+    map.insert(c2pa_cbor::Value::Integer(3), c2pa_cbor::Value::Integer(-8));  // alg: EdDSA
+    map.insert(c2pa_cbor::Value::Integer(-1), c2pa_cbor::Value::Integer(6));  // crv: Ed25519
     map.insert(c2pa_cbor::Value::Integer(-2), c2pa_cbor::Value::Bytes(verifying_key.as_bytes().to_vec())); // x
     c2pa_cbor::Value::Map(map)
 }
@@ -329,7 +331,10 @@ fn build_signer_binding(
         .to_tagged_vec()
         .map_err(|e| Error::BadParam(format!("failed to encode signer binding: {e}")))?;
 
-    Ok(c2pa_cbor::Value::Bytes(binding_bytes))
+    // Deserialize back to a Value so the COSE_Sign1 is embedded as a tagged
+    // CBOR structure (tag 18) rather than an opaque bstr.
+    c2pa_cbor::from_slice(&binding_bytes)
+        .map_err(|e| Error::BadParam(format!("failed to decode signer binding as CBOR Value: {e}")))
 }
 
 // ── VSI COSE_Sign1 construction ──────────────────────────────────────────────
