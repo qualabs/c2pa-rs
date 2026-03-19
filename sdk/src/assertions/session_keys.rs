@@ -24,6 +24,34 @@ use crate::{
     Result,
 };
 
+/// Serialize the `signer_binding` field as COSE_Sign1_Tagged (CBOR tag 18 + content).
+///
+/// The c2pa_cbor encoder recognizes `__cbor_tag_18__` in `serialize_newtype_struct`
+/// and writes the proper CBOR tag 18 prefix before the inner value.
+fn serialize_cose_sign1_tagged<S>(
+    value: &c2pa_cbor::Value,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_newtype_struct("__cbor_tag_18__", value)
+}
+
+/// Deserialize the `signer_binding` field.
+///
+/// The c2pa_cbor decoder transparently strips CBOR tags, so whether the wire
+/// format contains tag 18 (spec-compliant) or a raw bstr (legacy), the inner
+/// value is returned as-is.
+fn deserialize_cose_sign1_tagged<'de, D>(
+    deserializer: D,
+) -> std::result::Result<c2pa_cbor::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    c2pa_cbor::Value::deserialize(deserializer)
+}
+
 /// A single session key used to verify VSI signatures ([§18.25]).
 ///
 /// [§18.25]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_session_keys
@@ -37,7 +65,14 @@ pub struct SessionKey {
     pub created_at: DateT,
     /// Seconds from `created_at` for which this key is valid.
     pub validity_period: u64,
-    /// COSE_Sign1_Tagged binding this key to the signer's certificate, stored as raw CBOR.
+    /// COSE_Sign1_Tagged binding this key to the signer's certificate.
+    ///
+    /// Stored internally as the inner COSE_Sign1 content (without tag 18).
+    /// The CBOR tag 18 is added/stripped transparently during serialization/deserialization.
+    #[serde(
+        serialize_with = "serialize_cose_sign1_tagged",
+        deserialize_with = "deserialize_cose_sign1_tagged"
+    )]
     pub signer_binding: c2pa_cbor::Value,
 }
 
