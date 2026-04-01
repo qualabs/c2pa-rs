@@ -92,3 +92,6 @@ pub use soft_binding::{SoftBinding, SoftBindingBlock, SoftBindingScope, SoftBind
 
 mod live_video_segment;
 pub use live_video_segment::{ContinuityMethod, LiveVideoSegment};
+
+mod session_keys;
+pub use session_keys::{SessionKey, SessionKeys};

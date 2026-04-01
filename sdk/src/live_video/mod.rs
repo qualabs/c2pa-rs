@@ -13,8 +13,15 @@
 
 //! Support for C2PA Live Video signing and validation (section 19 of the C2PA Technical Specification).
 //!
-//! Implements the per-segment C2PA Manifest Box method (section 19.3), where each segment
-//! carries its own C2PA Manifest with a [`LiveVideoSegment`] assertion for continuity tracking.
+//! Implements two validation methods:
+//!
+//! - **Section 19.3** (per-segment C2PA Manifest Box): each segment carries its own C2PA
+//!   Manifest with a [`LiveVideoSegment`] assertion. Use [`LiveVideoValidator::validate_media_segment`].
+//!
+//! - **Section 19.4** (Verifiable Segment Info): the init segment manifest contains a
+//!   [`crate::assertions::SessionKeys`] assertion; each media segment carries a COSE_Sign1 in
+//!   an `emsg` box. Use [`LiveVideoValidator::validate_session_keys`] and
+//!   [`LiveVideoValidator::validate_verifiable_segment_info`].
 //!
 //! # Signing
 //!
@@ -24,37 +31,36 @@
 //!
 //! Use [`LiveVideoValidator`] to validate a signed live video stream.
 //!
-//! See [C2PA Technical Specification — Live Video](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_live_video).
+//! See [C2PA Technical Specification - Live Video](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_live_video).
 
+pub(crate) mod cose_key;
+mod segment_manifest_validation;
+mod session_key_validation;
+pub mod verifiable_segment_info;
 mod signing;
+mod vsi_signing;
 
+pub use ed25519_dalek::SigningKey as Ed25519SessionKey;
 pub use signing::LiveVideoSigner;
-
-use std::io::{Cursor, Read, Seek, SeekFrom};
+pub use vsi_signing::LiveVideoVsiSigner;
 
 use crate::{
-    assertions::{ContinuityMethod, LiveVideoSegment},
+    assertions::{LiveVideoSegment, SessionKey, SessionKeys},
     error::{Error, Result},
     log_item,
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
-        LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_CONTINUITY_METHOD_INVALID,
-        LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID, LIVEVIDEO_SEGMENT_INVALID,
+        LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
     },
 };
 
-/// FourCC byte value for an ISO BMFF `mdat` (Media Data) box.
+use self::cose_key::kid_from_cose_key;
+
 const MDAT_BOX_TYPE: u32 = 0x6d646174;
-
-/// FourCC byte value for an ISO BMFF `uuid` (User Data) box.
 const UUID_BOX_TYPE: u32 = 0x75756964;
-
-/// FourCC byte value for an ISO BMFF `emsg` (Event Message) box.
 const EMSG_BOX_TYPE: u32 = 0x656d7367;
 
 /// C2PA UUID identifying a `uuid` box that contains a C2PA Manifest Store.
-///
-/// See [C2PA Technical Specification section A.5.1](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_the_uuid_box_for_c2pa).
 const C2PA_UUID: [u8; 16] = [
     0xd8, 0xfe, 0xc3, 0xd6, 0x1b, 0x0e, 0x48, 0x3c,
     0x92, 0x97, 0x58, 0x28, 0x87, 0x7e, 0xc4, 0x81,
@@ -72,31 +78,32 @@ fn fail_validation(
     Ok(())
 }
 
-/// Snapshot of the validated state from the most recently accepted segment.
-///
-/// Used to enforce cross-segment continuity rules ([section 19.7.2](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_live_video_validation_process)).
 struct SegmentState {
     sequence_number: u64,
     stream_id: String,
     manifest_id: String,
 }
 
-/// Validates a sequence of live video segments against the C2PA section 19 rules.
+/// Validates a sequence of live video segments against C2PA section 19 rules.
 ///
-/// Create one instance per live stream and call [`validate_init_segment`] followed by
-/// [`validate_media_segment`] for each subsequent segment, in order.
+/// Supports section [19.3] (per-segment C2PA Manifest Box) and section [19.4] (Verifiable
+/// Segment Info). Create one instance per live stream; for 19.4 call
+/// [`validate_session_keys`] after [`validate_init_segment`].
 ///
+/// [19.3]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#using_c2pa_manifest_box
+/// [19.4]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#verifiable_segment_info
+/// [`validate_session_keys`]: LiveVideoValidator::validate_session_keys
 /// [`validate_init_segment`]: LiveVideoValidator::validate_init_segment
-/// [`validate_media_segment`]: LiveVideoValidator::validate_media_segment
 pub struct LiveVideoValidator {
     previous_segment: Option<SegmentState>,
+    session_keys: Vec<SessionKey>,
 }
 
 impl LiveVideoValidator {
-    /// Creates a new validator for a live stream.
     pub fn new() -> Self {
         Self {
             previous_segment: None,
+            session_keys: Vec::new(),
         }
     }
 
@@ -108,7 +115,7 @@ impl LiveVideoValidator {
         segment_data: &[u8],
         tracker: &mut StatusTracker,
     ) -> Result<()> {
-        if segment_contains_box_type(segment_data, MDAT_BOX_TYPE) {
+        if segment_manifest_validation::segment_contains_box_type(segment_data, MDAT_BOX_TYPE) {
             fail_validation(
                 "initialization segment must not contain an mdat box",
                 LIVEVIDEO_INIT_INVALID,
@@ -158,104 +165,83 @@ impl LiveVideoValidator {
         Ok(())
     }
 
-    fn validate_segment_has_c2pa_or_emsg(
-        &self,
-        segment_data: &[u8],
+    /// Validates a `c2pa.session-keys` assertion and stores the keys for VSI verification ([§19.4]).
+    ///
+    /// If `ee_cert_der` is provided (the DER-encoded end-entity certificate from the manifest
+    /// signer), each key's `signerBinding` COSE_Sign1 is verified against it ([§19.7.3]).
+    /// Callers SHOULD provide the certificate for spec-compliant validation.
+    ///
+    /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#verifiable_segment_info
+    /// [§19.7.3]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_verifiable_segment_info_validation
+    pub fn validate_session_keys(
+        &mut self,
+        assertion: &SessionKeys,
+        ee_cert_der: Option<&[u8]>,
         tracker: &mut StatusTracker,
     ) -> Result<()> {
-        let has_c2pa_manifest_box = segment_contains_c2pa_uuid_box(segment_data);
-        let has_emsg_box = segment_contains_box_type(segment_data, EMSG_BOX_TYPE);
-
-        if !has_c2pa_manifest_box && !has_emsg_box {
-            fail_validation(
-                "segment must contain a C2PA Manifest Box (uuid) or an emsg box",
-                LIVEVIDEO_SEGMENT_INVALID,
+        if assertion.keys.is_empty() {
+            return fail_validation(
+                "session-keys assertion must contain at least one key",
+                LIVEVIDEO_SESSIONKEY_INVALID,
                 tracker,
-            )?;
+            );
         }
-        Ok(())
-    }
 
-    fn validate_sequence_number(
-        &self,
-        assertion: &LiveVideoSegment,
-        previous: &SegmentState,
-        tracker: &mut StatusTracker,
-    ) -> Result<()> {
-        if assertion.sequence_number <= previous.sequence_number {
-            fail_validation(
-                "sequenceNumber must be strictly greater than the previous segment's",
-                LIVEVIDEO_ASSERTION_INVALID,
-                tracker,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn validate_stream_id(
-        &self,
-        assertion: &LiveVideoSegment,
-        previous: &SegmentState,
-        tracker: &mut StatusTracker,
-    ) -> Result<()> {
-        if assertion.stream_id != previous.stream_id {
-            fail_validation(
-                "streamId must match the previous segment's streamId",
-                LIVEVIDEO_ASSERTION_INVALID,
-                tracker,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn validate_continuity_rules(
-        &self,
-        assertion: &LiveVideoSegment,
-        manifest_id: &str,
-        tracker: &mut StatusTracker,
-    ) -> Result<()> {
-        match &assertion.continuity_method {
-            ContinuityMethod::ManifestId => {
-                self.validate_manifest_id_continuity(assertion, manifest_id, tracker)
-            }
-            ContinuityMethod::Unknown(method) => {
-                fail_validation(
-                    format!("unsupported continuity method: {method}"),
-                    LIVEVIDEO_CONTINUITY_METHOD_INVALID,
-                    tracker,
-                )
-            }
-        }
-    }
-
-    fn validate_manifest_id_continuity(
-        &self,
-        assertion: &LiveVideoSegment,
-        _current_manifest_id: &str,
-        tracker: &mut StatusTracker,
-    ) -> Result<()> {
-        let Some(previous) = &self.previous_segment else {
-            return Ok(());
-        };
-
-        let previous_manifest_id = match &assertion.previous_manifest_id {
-            Some(id) => id,
-            None => {
+        for key in &assertion.keys {
+            if kid_from_cose_key(&key.key).is_none() {
                 return fail_validation(
-                    "previousManifestId is required when continuityMethod is c2pa.manifestId",
-                    LIVEVIDEO_CONTINUITY_METHOD_INVALID,
+                    "session key COSE_Key must include a kid (key identifier)",
+                    LIVEVIDEO_SESSIONKEY_INVALID,
                     tracker,
                 );
             }
-        };
 
-        if previous_manifest_id != &previous.manifest_id {
-            fail_validation(
-                "previousManifestId does not match the previous segment's manifest identifier",
-                LIVEVIDEO_SEGMENT_INVALID,
-                tracker,
-            )?;
+            if key.validity_period == 0 {
+                return fail_validation(
+                    "session key validityPeriod must be greater than zero",
+                    LIVEVIDEO_SESSIONKEY_INVALID,
+                    tracker,
+                );
+            }
+
+            if let Some(cert) = ee_cert_der {
+                self.verify_signer_binding(key, cert, tracker)?;
+            }
         }
+
+        self.session_keys = assertion.keys.clone();
+        Ok(())
+    }
+
+    /// Validates a media segment using the Verifiable Segment Info method ([§19.4]).
+    ///
+    /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#verifiable_segment_info
+    pub fn validate_verifiable_segment_info(
+        &mut self,
+        segment_data: &[u8],
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        self.require_session_keys(tracker)?;
+        let parsed = self.extract_and_parse_vsi(segment_data, tracker)?;
+        let session_key = self.resolve_session_key(&parsed.sign1, tracker)?;
+        let seq_num = parsed.segment_info_map.sequence_number;
+
+        self.validate_vsi_sequence_bounds(seq_num, &session_key, tracker)?;
+        self.validate_vsi_key_validity(&session_key, tracker)?;
+        self.validate_vsi_signature(&parsed.sign1, &session_key, tracker)?;
+        self.validate_vsi_sequence_continuity(seq_num, tracker)?;
+        self.validate_vsi_bmff_hash(
+            segment_data,
+            &parsed.segment_info_map.bmff_hash,
+            tracker,
+        )?;
+
+        self.previous_segment = Some(SegmentState {
+            sequence_number: seq_num,
+            stream_id: String::new(),
+            manifest_id: parsed.segment_info_map.manifest_id.clone(),
+        });
+
         Ok(())
     }
 }
@@ -266,427 +252,5 @@ impl Default for LiveVideoValidator {
     }
 }
 
-/// Returns `true` if the BMFF data contains a top-level box with the given FourCC type.
-fn segment_contains_box_type(data: &[u8], target_type: u32) -> bool {
-    let mut cursor = Cursor::new(data);
-    loop {
-        let box_start = cursor.stream_position().unwrap_or(0);
-        match read_box_header(&mut cursor) {
-            Ok((box_type, box_size)) => {
-                if box_type == target_type {
-                    return true;
-                }
-                // box_size is the total size from the start of the box header.
-                let next = box_start + box_size;
-                if cursor.seek(SeekFrom::Start(next)).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    false
-}
-
-/// Returns `true` if the BMFF data contains a `uuid` box with the C2PA Manifest Store UUID.
-fn segment_contains_c2pa_uuid_box(data: &[u8]) -> bool {
-    let mut cursor = Cursor::new(data);
-    loop {
-        let box_start = cursor.stream_position().unwrap_or(0);
-        match read_box_header(&mut cursor) {
-            Ok((box_type, box_size)) => {
-                if box_type == UUID_BOX_TYPE {
-                    let mut uuid_bytes = [0u8; 16];
-                    if cursor.read_exact(&mut uuid_bytes).is_ok() && uuid_bytes == C2PA_UUID {
-                        return true;
-                    }
-                }
-                // box_size is the total size from the start of the box header.
-                let next = box_start + box_size;
-                if cursor.seek(SeekFrom::Start(next)).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    false
-}
-
-/// Reads a single ISO BMFF box header and returns `(fourcc, total_box_size_in_bytes)`.
-fn read_box_header<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64)> {
-    let mut header = [0u8; 8];
-    reader.read_exact(&mut header).map_err(|_| Error::NotFound)?;
-
-    let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-    let box_type = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-
-    let total_size = if size == 1 {
-        // Extended (64-bit) size field follows the 8-byte header.
-        let mut large_size_bytes = [0u8; 8];
-        reader
-            .read_exact(&mut large_size_bytes)
-            .map_err(|_| Error::NotFound)?;
-        u64::from_be_bytes(large_size_bytes)
-    } else if size == 0 {
-        // Size == 0 means "extends to end of stream"; treat as very large.
-        u64::MAX
-    } else {
-        size as u64
-    };
-
-    Ok((box_type, total_size))
-}
-
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::panic)]
-    #![allow(clippy::unwrap_used)]
-
-    use std::collections::HashMap;
-
-    use super::*;
-    use crate::{
-        assertions::{ContinuityMethod, LiveVideoSegment},
-        status_tracker::StatusTracker,
-    };
-
-    fn make_segment(sequence_number: u64, stream_id: &str) -> LiveVideoSegment {
-        LiveVideoSegment {
-            sequence_number,
-            stream_id: stream_id.to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: Some("urn:c2pa:prev-manifest".to_string()),
-            additional_fields: HashMap::new(),
-        }
-    }
-
-    fn make_uuid_box(include_c2pa_uuid: bool) -> Vec<u8> {
-        let mut data = Vec::new();
-        // size: 8 header + 16 uuid = 24
-        let size: u32 = 24;
-        data.extend_from_slice(&size.to_be_bytes());
-        data.extend_from_slice(b"uuid");
-        if include_c2pa_uuid {
-            data.extend_from_slice(&C2PA_UUID);
-        } else {
-            data.extend_from_slice(&[0u8; 16]);
-        }
-        data
-    }
-
-    fn make_mdat_box() -> Vec<u8> {
-        let mut data = Vec::new();
-        let size: u32 = 8;
-        data.extend_from_slice(&size.to_be_bytes());
-        data.extend_from_slice(b"mdat");
-        data
-    }
-
-    fn make_emsg_box() -> Vec<u8> {
-        let mut data = Vec::new();
-        let size: u32 = 8;
-        data.extend_from_slice(&size.to_be_bytes());
-        data.extend_from_slice(b"emsg");
-        data
-    }
-
-    fn aggregate_tracker() -> StatusTracker {
-        StatusTracker::default()
-    }
-
-    #[test]
-    fn init_segment_without_mdat_is_valid() {
-        let validator = LiveVideoValidator::new();
-        let segment = make_uuid_box(true);
-        let mut tracker = aggregate_tracker();
-
-        validator
-            .validate_init_segment(&segment, &mut tracker)
-            .unwrap();
-
-        let failures: Vec<_> = tracker
-            .logged_items()
-            .iter()
-            .filter(|i| {
-                i.validation_status
-                    .as_deref()
-                    .map(|s| s.starts_with("livevideo"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert!(failures.is_empty());
-    }
-
-    #[test]
-    fn init_segment_with_mdat_fails() {
-        let validator = LiveVideoValidator::new();
-        let mut segment = make_uuid_box(true);
-        segment.extend(make_mdat_box());
-        let mut tracker = aggregate_tracker();
-
-        let _ = validator.validate_init_segment(&segment, &mut tracker);
-
-        let has_init_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_INIT_INVALID)
-        });
-        assert!(has_init_invalid);
-    }
-
-    #[test]
-    fn fail_segment_manifest_records_manifest_invalid() {
-        let validator = LiveVideoValidator::new();
-        let mut tracker = aggregate_tracker();
-
-        let _ = validator.fail_segment_manifest("no active manifest in segment", &mut tracker);
-
-        let has_manifest_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_MANIFEST_INVALID)
-        });
-        assert!(has_manifest_invalid);
-    }
-
-    #[test]
-    fn media_segment_without_c2pa_or_emsg_fails() {
-        let mut validator = LiveVideoValidator::new();
-        let segment_data = make_mdat_box();
-        let assertion = make_segment(1, "stream-1");
-        let mut tracker = aggregate_tracker();
-
-        let _ = validator.validate_media_segment(
-            &segment_data,
-            "urn:c2pa:manifest-1",
-            &assertion,
-            &mut tracker,
-        );
-
-        let has_segment_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
-        });
-        assert!(has_segment_invalid);
-    }
-
-    #[test]
-    fn valid_sequence_advances_state() {
-        let mut validator = LiveVideoValidator::new();
-        let segment_data = make_uuid_box(true);
-        let mut tracker = aggregate_tracker();
-
-        let first = LiveVideoSegment {
-            sequence_number: 1,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: None,
-            additional_fields: HashMap::new(),
-        };
-        validator
-            .validate_media_segment(&segment_data, "urn:c2pa:manifest-1", &first, &mut tracker)
-            .unwrap();
-
-        let second = LiveVideoSegment {
-            sequence_number: 2,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: Some("urn:c2pa:manifest-1".to_string()),
-            additional_fields: HashMap::new(),
-        };
-        validator
-            .validate_media_segment(&segment_data, "urn:c2pa:manifest-2", &second, &mut tracker)
-            .unwrap();
-
-        let live_failures: Vec<_> = tracker
-            .logged_items()
-            .iter()
-            .filter(|i| {
-                i.validation_status
-                    .as_deref()
-                    .map(|s| s.starts_with("livevideo"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert!(live_failures.is_empty());
-    }
-
-    #[test]
-    fn regressed_sequence_number_fails() {
-        let mut validator = LiveVideoValidator::new();
-        let segment_data = make_uuid_box(true);
-        let mut tracker = aggregate_tracker();
-
-        let first = LiveVideoSegment {
-            sequence_number: 5,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: None,
-            additional_fields: HashMap::new(),
-        };
-        let _ =
-            validator.validate_media_segment(&segment_data, "manifest-1", &first, &mut tracker);
-
-        let second = LiveVideoSegment {
-            sequence_number: 4, // regressed!
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: Some("manifest-1".to_string()),
-            additional_fields: HashMap::new(),
-        };
-        let _ =
-            validator.validate_media_segment(&segment_data, "manifest-2", &second, &mut tracker);
-
-        let has_assertion_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_ASSERTION_INVALID)
-        });
-        assert!(has_assertion_invalid);
-    }
-
-    #[test]
-    fn mismatched_stream_id_fails() {
-        let mut validator = LiveVideoValidator::new();
-        let segment_data = make_uuid_box(true);
-        let mut tracker = aggregate_tracker();
-
-        let first = LiveVideoSegment {
-            sequence_number: 1,
-            stream_id: "stream-A".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: None,
-            additional_fields: HashMap::new(),
-        };
-        let _ =
-            validator.validate_media_segment(&segment_data, "manifest-1", &first, &mut tracker);
-
-        let second = LiveVideoSegment {
-            sequence_number: 2,
-            stream_id: "stream-B".to_string(), // different!
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: Some("manifest-1".to_string()),
-            additional_fields: HashMap::new(),
-        };
-        let _ =
-            validator.validate_media_segment(&segment_data, "manifest-2", &second, &mut tracker);
-
-        let has_assertion_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_ASSERTION_INVALID)
-        });
-        assert!(has_assertion_invalid);
-    }
-
-    #[test]
-    fn missing_previous_manifest_id_fails_with_continuity_method_invalid() {
-        let mut validator = LiveVideoValidator::new();
-        let segment_data = make_uuid_box(true);
-        let mut tracker = aggregate_tracker();
-
-        // Advance state to segment 1
-        let first = LiveVideoSegment {
-            sequence_number: 1,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: None,
-            additional_fields: HashMap::new(),
-        };
-        let _ =
-            validator.validate_media_segment(&segment_data, "manifest-1", &first, &mut tracker);
-
-        // Segment 2 missing previousManifestId
-        let second = LiveVideoSegment {
-            sequence_number: 2,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: None, // missing!
-            additional_fields: HashMap::new(),
-        };
-        let _ =
-            validator.validate_media_segment(&segment_data, "manifest-2", &second, &mut tracker);
-
-        let has_continuity_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_CONTINUITY_METHOD_INVALID)
-        });
-        assert!(has_continuity_invalid);
-    }
-
-    #[test]
-    fn wrong_previous_manifest_id_fails_with_segment_invalid() {
-        let mut validator = LiveVideoValidator::new();
-        let segment_data = make_uuid_box(true);
-        let mut tracker = aggregate_tracker();
-
-        let first = LiveVideoSegment {
-            sequence_number: 1,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: None,
-            additional_fields: HashMap::new(),
-        };
-        let _ =
-            validator.validate_media_segment(&segment_data, "manifest-1", &first, &mut tracker);
-
-        let second = LiveVideoSegment {
-            sequence_number: 2,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: Some("manifest-WRONG".to_string()), // incorrect!
-            additional_fields: HashMap::new(),
-        };
-        let _ =
-            validator.validate_media_segment(&segment_data, "manifest-2", &second, &mut tracker);
-
-        let has_segment_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
-        });
-        assert!(has_segment_invalid);
-    }
-
-    #[test]
-    fn unknown_continuity_method_fails() {
-        let mut validator = LiveVideoValidator::new();
-        let segment_data = make_uuid_box(true);
-        let mut tracker = aggregate_tracker();
-
-        let assertion = LiveVideoSegment {
-            sequence_number: 1,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::Unknown("vendor.custom".to_string()),
-            previous_manifest_id: None,
-            additional_fields: HashMap::new(),
-        };
-        let _ = validator.validate_media_segment(
-            &segment_data,
-            "manifest-1",
-            &assertion,
-            &mut tracker,
-        );
-
-        let has_continuity_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_CONTINUITY_METHOD_INVALID)
-        });
-        assert!(has_continuity_invalid);
-    }
-
-    #[test]
-    fn emsg_box_satisfies_presence_check() {
-        let mut validator = LiveVideoValidator::new();
-        let segment_data = make_emsg_box();
-        let mut tracker = aggregate_tracker();
-
-        let assertion = LiveVideoSegment {
-            sequence_number: 1,
-            stream_id: "stream-1".to_string(),
-            continuity_method: ContinuityMethod::ManifestId,
-            previous_manifest_id: None,
-            additional_fields: HashMap::new(),
-        };
-        // Should NOT produce livevideo.segment.invalid for missing C2PA box
-        let _ = validator.validate_media_segment(
-            &segment_data,
-            "manifest-1",
-            &assertion,
-            &mut tracker,
-        );
-
-        let has_segment_invalid = tracker.logged_items().iter().any(|i| {
-            i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)
-        });
-        assert!(!has_segment_invalid);
-    }
-}
+mod test_helpers;
