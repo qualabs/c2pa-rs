@@ -564,6 +564,8 @@ fn sign_fragmented(
     init_pattern: &Path,
     frag_pattern: &PathBuf,
     output_path: &Path,
+    sidecar: bool,
+    remote_url: Option<&str>,
 ) -> Result<()> {
     // search folders for init segments
     let ip = init_pattern.to_str().ok_or(c2pa::Error::OtherError(
@@ -591,7 +593,20 @@ fn sign_fragmented(
                 println!("Adding manifest to: {p:?}");
                 let new_output_path =
                     output_path.join(init_dir.file_name().context("invalid file name")?);
-                builder.sign_fragmented_files(signer, &p, &fragments, &new_output_path)?;
+                let jumbf =
+                    builder.sign_fragmented_files(signer, &p, &fragments, &new_output_path)?;
+                if sidecar || remote_url.is_some() {
+                    let sidecar_path = new_output_path
+                        .join(p.file_stem().unwrap_or_default())
+                        .with_extension("c2pa");
+                    std::fs::write(&sidecar_path, &jumbf)?;
+                    if let Some(url) = remote_url {
+                        println!(
+                            "Manifest written to {:?} - upload to {} to complete remote manifest",
+                            sidecar_path, url
+                        );
+                    }
+                }
 
                 count += 1;
             }
@@ -634,9 +649,8 @@ fn verify_fragmented(init_pattern: &Path, frag_pattern: &Path) -> Result<Vec<Rea
                 println!("Verifying manifest: {p:?}");
                 let reader = Reader::from_fragmented_files(p, &fragments)?;
                 if let Some(vs) = reader.validation_status() {
-                    if let Some(e) = vs.iter().find(|v| !v.passed()) {
-                        eprintln!("Error validating segments: {e:?}");
-                        return Ok(readers);
+                    for e in vs.iter().filter(|v| !v.passed()) {
+                        eprintln!("Validation error: {e:?}");
                     }
                 }
 
@@ -908,6 +922,9 @@ fn main() -> Result<()> {
             }
         }
 
+        let sign_sidecar = args.sidecar;
+        let sign_remote_url = args.remote.clone();
+
         if let Some(remote) = args.remote {
             if args.sidecar {
                 builder.set_no_embed(true);
@@ -945,7 +962,15 @@ fn main() -> Result<()> {
                 }
 
                 if let Some(fg) = &fragments_glob {
-                    return sign_fragmented(&mut builder, signer.as_ref(), &args.path, fg, &output);
+                    return sign_fragmented(
+                        &mut builder,
+                        signer.as_ref(),
+                        &args.path,
+                        fg,
+                        &output,
+                        sign_sidecar,
+                        sign_remote_url.as_deref(),
+                    );
                 } else {
                     bail!("fragments_glob must be set");
                 }
