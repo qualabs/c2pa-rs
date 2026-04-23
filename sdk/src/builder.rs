@@ -2794,7 +2794,7 @@ impl Builder {
         asset_path: P,
         fragment_paths: &Vec<std::path::PathBuf>,
         output_path: P,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         if !output_path.as_ref().exists() {
             // ensure the path exists
             std::fs::create_dir_all(output_path.as_ref())?;

@@ -2810,6 +2810,7 @@ impl Store {
         output_dir: &Path,
         reserve_size: usize,
         settings: &Settings,
+        remote_url: Option<&str>,
     ) -> Result<Vec<u8>> {
         // get the provenance claim changing mutability
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
@@ -2841,6 +2842,18 @@ impl Store {
 
         // add in the BMFF assertion
         pc.add_assertion(&bmff_hash)?;
+
+        // Embed XMP remote reference before JUMBF write so inithash covers it
+        if let Some(url) = remote_url {
+            let io_handler = crate::jumbf_io::get_assetio_handler_from_path(&dest_path)
+                .ok_or(Error::UnsupportedType)?;
+            let embed_handler = io_handler
+                .remote_ref_writer_ref()
+                .ok_or(Error::XmpNotSupported)?;
+            embed_handler
+                .embed_reference(&dest_path, RemoteRefEmbedType::Xmp(url.to_string()))
+                .map_err(|_| Error::EmbeddingError)?;
+        }
 
         // 3) Generate in memory CAI jumbf block
         // and write preliminary jumbf store to file
@@ -2878,7 +2891,7 @@ impl Store {
         output_path: &Path,
         signer: &dyn Signer,
         context: &Context,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         match get_supported_file_extension(asset_path) {
             Some(ext) => {
                 if !is_bmff_format(&ext) {
@@ -2890,6 +2903,22 @@ impl Store {
 
         let output_filename = asset_path.file_name().ok_or(Error::NotFound)?;
         let dest_path = output_path.join(output_filename);
+
+        // Read remote manifest mode before mutable borrows
+        let remote_manifest_mode = self
+            .provenance_claim()
+            .map(|pc| pc.remote_manifest())
+            .unwrap_or(RemoteManifest::NoRemote);
+        let embed_jumbf = matches!(
+            remote_manifest_mode,
+            RemoteManifest::NoRemote | RemoteManifest::EmbedWithRemote(_)
+        );
+        let remote_url = match &remote_manifest_mode {
+            RemoteManifest::Remote(url) | RemoteManifest::EmbedWithRemote(url) => {
+                Some(url.clone())
+            }
+            _ => None,
+        };
 
         let mut validation_log =
             StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
@@ -2910,6 +2939,7 @@ impl Store {
             output_path,
             signer.reserve_size(),
             context.settings(),
+            remote_url.as_deref(),
         )?;
 
         let mut preliminary_claim = PartialClaim::default();
@@ -2926,31 +2956,21 @@ impl Store {
 
         // update the JUMBF if modified with dynamic assertions
         if modified {
-            let pc = temp_store.provenance_claim().ok_or(Error::ClaimEncoding)?;
-            match pc.remote_manifest() {
-                RemoteManifest::NoRemote | RemoteManifest::EmbedWithRemote(_) => {
-                    jumbf_bytes = temp_store.to_jumbf_internal(signer.reserve_size())?;
-
-                    // save the jumbf to the output path
-                    save_jumbf_to_file(&jumbf_bytes, &dest_path, Some(&dest_path))?;
-
-                    let pc = temp_store
-                        .provenance_claim_mut()
-                        .ok_or(Error::ClaimEncoding)?;
-                    // generate actual hash values
-                    let bmff_hashes = pc.bmff_hash_assertions();
-
-                    if !bmff_hashes.is_empty() {
-                        let mut bmff_hash = BmffHash::from_assertion(bmff_hashes[0].assertion())?;
-                        bmff_hash.update_fragmented_inithash(&dest_path)?;
-                        pc.update_bmff_hash(bmff_hash)?;
-                    }
-
-                    // regenerate the jumbf because the cbor changed
-                    jumbf_bytes = temp_store.to_jumbf_internal(signer.reserve_size())?;
+            jumbf_bytes = temp_store.to_jumbf_internal(signer.reserve_size())?;
+            if embed_jumbf {
+                save_jumbf_to_file(&jumbf_bytes, &dest_path, Some(&dest_path))?;
+                let pc = temp_store
+                    .provenance_claim_mut()
+                    .ok_or(Error::ClaimEncoding)?;
+                let bmff_hashes = pc.bmff_hash_assertions();
+                if !bmff_hashes.is_empty() {
+                    let mut bmff_hash =
+                        BmffHash::from_assertion(bmff_hashes[0].assertion())?;
+                    bmff_hash.update_fragmented_inithash(&dest_path)?;
+                    pc.update_bmff_hash(bmff_hash)?;
                 }
-                _ => (),
-            };
+                jumbf_bytes = temp_store.to_jumbf_internal(signer.reserve_size())?;
+            }
         }
 
         // sign the claim
@@ -2958,10 +2978,38 @@ impl Store {
         let sig = temp_store.sign_claim(pc, signer, signer.reserve_size(), context.settings())?;
         let sig_placeholder = Store::sign_claim_placeholder(pc, signer.reserve_size());
 
-        match temp_store.finish_save(jumbf_bytes, &dest_path, sig, &sig_placeholder) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        }
+        let final_jumbf = if embed_jumbf {
+            let (_, jumbf) =
+                temp_store.finish_save(jumbf_bytes, &dest_path, sig, &sig_placeholder)?;
+            jumbf
+        } else {
+            // Patch signature into JUMBF bytes without writing to the init segment
+            if sig_placeholder.len() != sig.len() {
+                return Err(Error::CoseSigboxTooSmall);
+            }
+            patch_bytes(&mut jumbf_bytes, &sig_placeholder, &sig)
+                .map_err(|_| Error::JumbfCreationError)?;
+
+            // Restore init segment: copy original clean file over the placeholder version
+            std::fs::copy(asset_path, &dest_path)
+                .map_err(|e| Error::BadParam(format!("could not restore init segment: {e}")))?;
+
+            // Re-embed XMP URL for remote modes
+            if let Some(ref url) = remote_url {
+                let io_handler =
+                    crate::jumbf_io::get_assetio_handler_from_path(&dest_path).ok_or(Error::UnsupportedType)?;
+                let embed_handler = io_handler
+                    .remote_ref_writer_ref()
+                    .ok_or(Error::XmpNotSupported)?;
+                embed_handler
+                    .embed_reference(&dest_path, RemoteRefEmbedType::Xmp(url.to_string()))
+                    .map_err(|_| Error::EmbeddingError)?;
+            }
+
+            jumbf_bytes
+        };
+
+        Ok(final_jumbf)
     }
 
     /// Embed the claims store as JUMBF into a stream. Updates XMP with provenance

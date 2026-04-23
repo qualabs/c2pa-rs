@@ -125,7 +125,7 @@ mod cawg {
                     println!("Adding manifest to: {p:?}");
                     let new_output_path =
                         output_path.join(init_dir.file_name().context("invalid file name")?);
-                    builder.sign_fragmented_files(signer, &p, &fragments, &new_output_path)?;
+                    builder.sign_fragmented_files(signer, &p, &fragments, &new_output_path).map(|_| ()).map_err(anyhow::Error::from)?;
 
                     count += 1;
                 }
