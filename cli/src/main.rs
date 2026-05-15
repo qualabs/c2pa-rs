@@ -145,8 +145,8 @@ struct CliArgs {
     #[clap(long = "no_signing_verify")]
     no_signing_verify: bool,
 
-    /// Do not use Brotli-compressed manifest store (`c2cm`). Compression is preferred by default
-    /// when the format supports it. Equivalent to `core.prefer_compress_manifests = false` in settings.
+    /// Do not use Brotli-compressed manifest store (`c2cm`). Compression is preferred by
+    /// default when supported. Equivalent to `core.prefer_compress_manifests = false` in settings.
     #[clap(long = "no-compress-manifest")]
     no_compress_manifest: bool,
 

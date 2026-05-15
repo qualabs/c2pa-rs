@@ -2909,8 +2909,18 @@ impl Store {
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
         pc.set_signature_val(sig.clone());
 
-        // update the JUMBF with the signature
-        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        // BMFF remote/sidecar: compress only in the final manifest bytes (see builder::to_claim).
+        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+        if settings.core.prefer_compress_manifests
+            && is_bmff_format(format)
+            && matches!(
+                pc.remote_manifest(),
+                RemoteManifest::Remote(_) | RemoteManifest::SideCar
+            )
+        {
+            pc.set_compressed_manifest(true);
+        }
+
         let jumbf_bytes = self.to_jumbf_internal(signer.reserve_size())?;
 
         output_stream.rewind()?;
@@ -3257,7 +3267,9 @@ impl Store {
 
         // regenerate the jumbf because the cbor changed
         data = self.to_jumbf_internal(reserve_size)?;
-        if jumbf_size != data.len() {
+        // Embedded manifests require identical size for in-place patching. Remote/sidecar
+        // manifests are returned as bytes only; size may change after hash finalization.
+        if !remove_manifests && jumbf_size != data.len() {
             return Err(Error::JumbfCreationError);
         }
 

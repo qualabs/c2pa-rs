@@ -1450,8 +1450,13 @@ impl Builder {
         }
 
         // set compression override setting
-        let compress = self.context().settings().core.prefer_compress_manifests;
-        claim.set_compressed_manifest(compress);
+        let prefer_compress = self.context().settings().core.prefer_compress_manifests;
+        // BMFF remote/sidecar: keep the claim uncompressed through bmffHash hashing;
+        // save_to_stream applies c2cm when building the final sidecar bytes.
+        let bmff_remote_sidecar = self.no_embed
+            && self.remote_url.is_some()
+            && jumbf_io::is_bmff_format(&definition.format);
+        claim.set_compressed_manifest(prefer_compress && !bmff_remote_sidecar);
 
         if let Some(thumb_ref) = definition.thumbnail.as_ref() {
             // Setting the format to "none" will ensure that no claim thumbnail is added
