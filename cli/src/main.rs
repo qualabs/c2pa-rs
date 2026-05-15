@@ -741,6 +741,16 @@ fn configure_sdk(args: &CliArgs) -> Result<Settings> {
         )?;
     }
 
+    if args.no_signing_verify {
+        settings.update_from_str(
+            r#"
+            [verify]
+            verify_after_sign = false
+            "#,
+            "toml",
+        )?;
+    }
+
     Ok(settings)
 }
 
@@ -1236,12 +1246,28 @@ fn main() -> Result<()> {
                     file.write_all(&manifest_data)?;
                 }
 
-                // generate a report on the output file
-                let mut reader = Reader::from_shared_context(&context)
-                    .with_file(&output)
-                    .map_err(special_errs)?;
-                validate_cawg(&mut reader)?;
-                print_reader(&reader, args.detailed, args.crjson)?;
+                // After signing with `--remote`, XMP points at a URL where the manifest is not
+                // uploaded yet; `Reader::with_file` would try to fetch that URL first. When we
+                // also wrote a sidecar, validate using the manifest bytes we just produced.
+                if !args.no_signing_verify {
+                    let mut reader = if args.sidecar && sign_remote_url.is_some() {
+                        let format = format_from_path(path)
+                            .or_else(|| format_from_path(&output))
+                            .ok_or(c2pa::Error::UnsupportedType)
+                            .context("unsupported file type")?;
+                        let mut out_file =
+                            File::open(&output).context("open output asset for validation")?;
+                        Reader::from_shared_context(&context)
+                            .with_manifest_data_and_stream(&manifest_data, &format, &mut out_file)
+                            .map_err(special_errs)?
+                    } else {
+                        Reader::from_shared_context(&context)
+                            .with_file(&output)
+                            .map_err(special_errs)?
+                    };
+                    validate_cawg(&mut reader)?;
+                    print_reader(&reader, args.detailed, args.crjson)?;
+                }
             }
         } else {
             bail!("Output path required with manifest definition")
