@@ -2794,9 +2794,23 @@ impl Store {
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
         pc.set_signature_val(sig);
 
+        // Remote/sidecar: compress in final manifest bytes only (see builder::to_claim).
+        let settings = context.settings();
+        if settings.core.prefer_compress_manifests
+            && !embed_jumbf
+            && matches!(
+                remote_manifest_mode,
+                RemoteManifest::Remote(_) | RemoteManifest::SideCar
+            )
+        {
+            let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+            pc.set_compressed_manifest(true);
+        }
+
         // regenerate the JUMBF with the signature
         let final_jumbf = self.to_jumbf_internal(signer.reserve_size())?;
-        if final_jumbf.len() != unsigned_jumbf.len() {
+        // In-place init patching requires identical size; remote sidecar bytes may differ.
+        if embed_jumbf && final_jumbf.len() != unsigned_jumbf.len() {
             return Err(Error::JumbfCreationError);
         }
 
