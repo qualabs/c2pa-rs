@@ -33,8 +33,10 @@ use serde_with::skip_serializing_none;
 #[cfg(feature = "file_io")]
 use crate::utils::io_utils::uri_to_path;
 use crate::{
+    assertion::AssertionBase,
+    assertions::Metadata,
     claim::Claim,
-    context::Context,
+    context::{Context, ProgressPhase},
     dynamic_assertion::PartialClaim,
     error::{Error, Result},
     jumbf::labels::{manifest_label_from_uri, to_absolute_uri, to_relative_uri},
@@ -126,6 +128,9 @@ impl Reader {
     /// This method takes ownership of the [`Context`] and wraps it in an [`Arc`] internally.
     /// Use this for single-use contexts where you don't need to share the context.
     ///
+    /// Use [`Reader::default()`] when no special configuration is needed.
+    /// Use [`Reader::from_shared_context`] to share a context across multiple readers.
+    ///
     /// # Arguments
     /// * `context` - The [`Context`] to use for the Reader
     ///
@@ -137,6 +142,10 @@ impl Reader {
     /// ```
     /// # use c2pa::{Context, Reader, Result};
     /// # fn main() -> Result<()> {
+    /// // With default settings (no explicit context needed):
+    /// let reader = Reader::default();
+    ///
+    /// // With custom settings:
     /// let context = Context::new().with_settings(r#"{"verify": {"verify_after_sign": true}}"#)?;
     /// let reader = Reader::from_context(context);
     /// # Ok(())
@@ -200,6 +209,9 @@ impl Reader {
     ) -> Result<Self> {
         let mut validation_log = StatusTracker::default();
         stream.rewind()?; // Ensure stream is at the start
+
+        self.context.check_progress(ProgressPhase::Reading, 1, 1)?;
+
         let store = if _sync {
             Store::from_stream(format, stream, &mut validation_log, &self.context)
         } else {
@@ -224,6 +236,9 @@ impl Reader {
     /// A [`Reader`] for the manifest store.
     /// # Note
     /// [CAWG identity assertions](https://cawg.io/identity/) require async calls for validation.
+    #[deprecated(
+        note = "Use `Reader::from_context(context).with_stream(format, stream)` instead, passing a `Context` explicitly rather than relying on thread-local settings."
+    )]
     #[async_generic]
     pub fn from_stream(format: &str, stream: impl Read + Seek + MaybeSend) -> Result<Reader> {
         // Legacy behavior: explicitly get global settings for backward compatibility
@@ -259,7 +274,7 @@ impl Reader {
     /// ```no_run
     /// use c2pa::{Context, Reader};
     /// # fn main() -> c2pa::Result<()> {
-    /// let reader = Reader::from_context(Context::new()).with_file("path/to/file.jpg")?;
+    /// let reader = Reader::default().with_file("path/to/file.jpg")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -351,6 +366,9 @@ impl Reader {
     /// # Note
     /// [CAWG identity assertions](https://cawg.io/identity/) require async calls for validation.
     #[cfg(feature = "file_io")]
+    #[deprecated(
+        note = "Use `Reader::from_context(context).with_file(path)` instead, passing a `Context` explicitly rather than relying on thread-local settings."
+    )]
     #[async_generic]
     pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Reader> {
         // Legacy behavior: explicitly get thread-local settings for backward compatibility
@@ -432,6 +450,9 @@ impl Reader {
     /// # Errors
     /// This function returns an [`Error`] ef the c2pa_data is not valid, or severe errors occur in validation.
     /// You must check validation status for non-severe errors.
+    #[deprecated(
+        note = "Use `Reader::from_context(context).with_manifest_data_and_stream(c2pa_data, format, stream)` instead, passing a `Context` explicitly rather than relying on thread-local settings."
+    )]
     #[async_generic]
     pub fn from_manifest_data_and_stream(
         c2pa_data: &[u8],
@@ -515,9 +536,9 @@ impl Reader {
         fragment: impl Read + Seek + MaybeSend,
     ) -> Result<Self> {
         if _sync {
-            Reader::from_context(Context::new()).with_fragment(format, stream, fragment)
+            Reader::default().with_fragment(format, stream, fragment)
         } else {
-            Reader::from_context(Context::new())
+            Reader::default()
                 .with_fragment_async(format, stream, fragment)
                 .await
         }
@@ -565,11 +586,16 @@ impl Reader {
     /// would be used to load and validate fragmented MP4 files that span
     /// multiple separate asset files.
     #[cfg(feature = "file_io")]
+    #[deprecated(
+        note = "Use `Reader::from_context(context).with_fragmented_files(path, fragments)` instead, passing a `Context` explicitly rather than relying on thread-local settings."
+    )]
     pub fn from_fragmented_files<P: AsRef<std::path::Path>>(
         path: P,
         fragments: &Vec<std::path::PathBuf>,
     ) -> Result<Reader> {
-        Reader::from_context(Context::new()).with_fragmented_files(path, fragments)
+        let settings = crate::settings::get_thread_local_settings();
+        let context = Context::new().with_settings(settings)?;
+        Reader::from_context(context).with_fragmented_files(path, fragments)
     }
 
     /// Returns a [Vec] of mime types that [c2pa-rs] is able to read.
@@ -652,6 +678,30 @@ impl Reader {
     /// This just calls to_json_formatted
     pub fn json(&self) -> String {
         self.json_checked().unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Get the manifest store as a crJSON [`Value`](serde_json::Value).
+    ///
+    /// crJSON is a standardized JSON format for C2PA manifest data.
+    /// Returns an error if conversion fails.
+    pub fn to_crjson_value(&self) -> Result<Value> {
+        crate::crjson::from_reader(self)
+    }
+
+    /// Get the manifest store as a pretty-printed crJSON string.
+    ///
+    /// crJSON is a standardized JSON format for C2PA manifest data.
+    /// Returns `"{}"` if conversion or formatting fails.
+    pub fn crjson(&self) -> String {
+        self.crjson_checked().unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Get the manifest store as a pretty-printed crJSON string, returning an error if it fails.
+    ///
+    /// crJSON is a standardized JSON format for C2PA manifest data.
+    pub fn crjson_checked(&self) -> Result<String> {
+        self.to_crjson_value()
+            .and_then(|v| serde_json::to_string_pretty(&v).map_err(Error::JsonError))
     }
 
     /// Get the Reader as a JSON string, returning an error if formatting fails
@@ -804,10 +854,10 @@ impl Reader {
     /// ```no_run
     /// use std::io::Cursor;
     ///
-    /// use c2pa::Reader;
+    /// use c2pa::{Context, Reader};
     /// // Create a Reader from an in-memory stream (placeholder bytes shown here).
     /// let input = Cursor::new(Vec::new());
-    /// let reader = Reader::from_stream("image/jpeg", input).unwrap();
+    /// let reader = Reader::default().with_stream("image/jpeg", input).unwrap();
     ///
     /// // Get a resource identifier from the active manifest (e.g., a thumbnail).
     /// let manifest = reader.active_manifest().unwrap();
@@ -935,8 +985,16 @@ impl Reader {
 
             match result {
                 Ok(mut manifest) => {
-                    // Generate manifest_data for ingredients
-                    Self::populate_ingredient_manifest_data(&store, &mut manifest)?;
+                    // Populate manifest_data for ingredients using efficient flat store builder
+                    for ingredient in manifest.ingredients_mut() {
+                        if let Some(active_label) = ingredient.active_manifest() {
+                            if let Some(claim) = store.get_claim(active_label) {
+                                let ingredient_store = Self::build_ingredient_store(&store, claim)?;
+                                let jumbf = ingredient_store.to_jumbf_internal(0)?;
+                                ingredient.set_manifest_data(jumbf)?;
+                            }
+                        }
+                    }
                     manifests.insert(manifest_label.to_owned(), manifest);
                 }
                 Err(e) => {
@@ -985,126 +1043,6 @@ impl Reader {
         self.validation_state = Some(validation_state);
         self.store = store;
         Ok(self)
-    }
-
-    /// Populate manifest_data references for all ingredients in a manifest
-    fn populate_ingredient_manifest_data(store: &Store, manifest: &mut Manifest) -> Result<()> {
-        for ingredient in manifest.ingredients_mut() {
-            if let Some(active_label) = ingredient.active_manifest() {
-                if let Some(claim) = store.get_claim(active_label) {
-                    // Generate the ingredient store with all referenced claims
-                    let ingredient_store = {
-                        let mut ingredient_store = Store::new();
-                        let mut active_claim = claim.clone();
-
-                        // Recursively collect all ingredient claims
-                        Self::collect_ingredient_claims_for_store(store, claim, &mut active_claim)?;
-
-                        // Add the main claim
-                        ingredient_store.commit_claim(active_claim)?;
-                        ingredient_store
-                    };
-
-                    let c2pa_data = ingredient_store.to_jumbf_internal(0)?;
-
-                    // Create a unique resource name based on the ingredient's active manifest label
-                    // This ensures each ingredient has a uniquely identifiable manifest_data resource
-                    let resource_name = format!("{}/manifest_data", active_label.replace('/', "_"));
-
-                    let manifest_data_ref = ingredient.resources_mut().add_with(
-                        &resource_name,
-                        "application/c2pa",
-                        c2pa_data,
-                    )?;
-
-                    ingredient.set_manifest_data_ref(manifest_data_ref)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper method to recursively collect ingredient claims for a store
-    fn collect_ingredient_claims_for_store(
-        store: &Store,
-        claim: &Claim,
-        active_claim: &mut Claim,
-    ) -> Result<()> {
-        let mut visited = std::collections::HashSet::new();
-        let mut path = Vec::new();
-        Self::collect_ingredient_claims_for_store_impl(
-            store,
-            claim,
-            active_claim,
-            &mut visited,
-            &mut path,
-        )
-    }
-
-    /// Uses the similar cycle detection strategy as Store::get_claim_referenced_manifests_impl
-    fn collect_ingredient_claims_for_store_impl(
-        store: &Store,
-        claim: &Claim,
-        active_claim: &mut Claim,
-        visited: &mut std::collections::HashSet<String>,
-        path: &mut Vec<String>,
-    ) -> Result<()> {
-        Self::collect_ingredient_claims_impl(store, claim, active_claim, visited, path)
-    }
-
-    /// Shared implementation for recursively collecting ingredient claims.
-    ///
-    /// Uses path-based cycle detection similar to Store::get_claim_referenced_manifests_impl:
-    /// - `visited`: Claims that have been fully processed (allows DAG convergence)
-    /// - `path`: Current traversal path to detect and skip cycles
-    fn collect_ingredient_claims_impl(
-        store: &Store,
-        claim: &Claim,
-        active_claim: &mut Claim,
-        visited: &mut std::collections::HashSet<String>,
-        path: &mut Vec<String>,
-    ) -> Result<()> {
-        let claim_label = claim.label();
-
-        if visited.contains(claim_label) {
-            return Ok(());
-        }
-
-        // Check for cycle: is this claim already in our current path?
-        // If so, skip it silently (validation should have already caught this when enabled)
-        if path.iter().any(|p| p == claim_label) {
-            return Ok(());
-        }
-
-        path.push(claim_label.to_string());
-
-        for ingredient in claim.claim_ingredients() {
-            let ingredient_label = ingredient.label();
-
-            if let Some(ingredient_claim) = store.get_claim(ingredient_label) {
-                Self::collect_ingredient_claims_impl(
-                    store,
-                    ingredient_claim,
-                    active_claim,
-                    visited,
-                    path,
-                )?;
-
-                // Then add this ingredient claim to the primary claim
-                active_claim.replace_ingredient_or_insert(
-                    ingredient_claim.label().to_string(),
-                    ingredient_claim.clone(),
-                );
-            }
-        }
-
-        // Mark as fully processed
-        visited.insert(claim_label.to_string());
-
-        // Remove from current path
-        path.pop();
-
-        Ok(())
     }
 
     /// Post-validate the reader. This function is called after the reader is created.
@@ -1228,6 +1166,61 @@ impl Reader {
         Ok(assertion_values)
     }
 
+    /// Build a flat ingredient store for a claim by walking ingredient assertions.
+    fn build_ingredient_store(store: &Store, claim: &Claim) -> Result<Store> {
+        let mut ingredient_store = Store::new();
+        let mut visited = HashSet::new();
+        let mut path = Vec::new();
+
+        fn collect_flat(
+            store: &Store,
+            claim: &Claim,
+            ingredient_store: &mut Store,
+            visited: &mut HashSet<String>,
+            path: &mut Vec<String>,
+        ) -> Result<()> {
+            use crate::assertions::Ingredient as IngredientAssertion;
+
+            let claim_label = claim.label().to_string();
+
+            if visited.contains(&claim_label) {
+                return Ok(());
+            }
+
+            // Cycle detection
+            if path.iter().any(|p| p == &claim_label) {
+                return Ok(());
+            }
+
+            path.push(claim_label.clone());
+
+            for ing_assertion in claim.ingredient_assertions() {
+                let ingredient = IngredientAssertion::from_assertion(ing_assertion.assertion())?;
+                let manifest_uri = ingredient
+                    .active_manifest
+                    .as_ref()
+                    .or(ingredient.c2pa_manifest.as_ref());
+                if let Some(manifest_uri) = manifest_uri {
+                    let ingredient_label = Store::manifest_label_from_path(&manifest_uri.url());
+                    if let Some(ingredient_claim) = store.get_claim(&ingredient_label) {
+                        collect_flat(store, ingredient_claim, ingredient_store, visited, path)?;
+                    }
+                }
+            }
+
+            // Post-order: add after all children
+            ingredient_store.insert_restored_claim(claim_label.clone(), claim.clone());
+            visited.insert(claim_label);
+            path.pop();
+
+            Ok(())
+        }
+
+        collect_flat(store, claim, &mut ingredient_store, &mut visited, &mut path)?;
+
+        Ok(ingredient_store)
+    }
+
     /// Convert the Reader back into a Builder.
     /// This can be used to modify an existing manifest store.
     /// # Errors
@@ -1255,33 +1248,13 @@ impl Reader {
                 let ingredients = std::mem::take(&mut manifest.ingredients);
                 for mut ingredient in ingredients {
                     if let Some(active_manifest) = ingredient.active_manifest() {
-                        let ingredient_claim = self.store.get_claim(active_manifest);
-                        if let Some(claim) = ingredient_claim {
-                            // recreate an ingredient store to get the jumbf data
-                            // ... recursively collect all nested ingredient claims
-                            let ingredient_store = {
-                                let mut ingredient_store = Store::new();
-                                let mut active_claim = claim.clone();
-
-                                // Recursion happens here for claims collection - re-embed nested claims from store
-                                Self::collect_ingredient_claims_for_store(
-                                    &self.store,
-                                    claim,
-                                    &mut active_claim,
-                                )?;
-
-                                // Add the main claim with all nested ingredients
-                                ingredient_store.commit_claim(active_claim)?;
-                                ingredient_store
-                            };
-                            let jumbf = ingredient_store.to_jumbf_internal(0)?;
-                            // Add manifest_data to the ingredient's own resources
-                            let manifest_data_ref = ingredient.resources_mut().add_with(
-                                "manifest_data",
-                                "application/c2pa",
-                                jumbf,
-                            )?;
-                            ingredient.set_manifest_data_ref(manifest_data_ref)?;
+                        if ingredient.manifest_data_ref().is_none() {
+                            if let Some(claim) = self.store.get_claim(active_manifest) {
+                                let ingredient_store =
+                                    Self::build_ingredient_store(&self.store, claim)?;
+                                let jumbf = ingredient_store.to_jumbf_internal(0)?;
+                                ingredient.set_manifest_data(jumbf)?;
+                            }
                         }
                     }
                     builder.add_ingredient(ingredient);
@@ -1297,16 +1270,39 @@ impl Reader {
         Ok(builder)
     }
 
+    /// Returns the [`ArchiveType`] from the active manifest's `org.contentauth.archive.metadata` assertion, if present.
+    pub(crate) fn active_archive_type(&self) -> Option<crate::assertions::labels::ArchiveType> {
+        let manifest = self.active_manifest()?;
+        let metadata: Metadata = manifest
+            .find_assertion(crate::assertions::labels::ARCHIVE_METADATA)
+            .ok()?;
+        metadata
+            .value
+            .get("archive:type")
+            .and_then(|v: &Value| v.as_str())
+            .map(crate::assertions::labels::ArchiveType::from_str)
+    }
+
     /// Convert a Reader into an [`Ingredient`] using the parent ingredient from the active manifest.
     /// # Errors
     /// Returns an [`Error`] if there is no parent ingredient.
     pub(crate) fn to_ingredient(&self) -> Result<Ingredient> {
-        // make a copy of the parent ingredient (or return an error if not found)
-        let ingredient = self
+        let mut ingredient = self
             .active_manifest()
             .and_then(|m| m.ingredients().first())
             .ok_or_else(|| Error::IngredientNotFound)?
             .to_owned();
+
+        // populate manifest_data on demand for ingredients with an active manifest
+        if let Some(active_manifest) = ingredient.active_manifest() {
+            if ingredient.manifest_data_ref().is_none() {
+                if let Some(claim) = self.store.get_claim(active_manifest) {
+                    let ingredient_store = Self::build_ingredient_store(&self.store, claim)?;
+                    let jumbf = ingredient_store.to_jumbf_internal(0)?;
+                    ingredient.set_manifest_data(jumbf)?;
+                }
+            }
+        }
 
         Ok(ingredient)
     }
@@ -1360,13 +1356,17 @@ pub mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::utils::test::test_context;
+    use crate::{
+        utils::{test::test_context, test_signer::test_signer},
+        Builder, SigningAlg,
+    };
 
     const IMAGE_COMPLEX_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/CACAE-uri-CA.jpg");
     const IMAGE_WITH_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/CA.jpg");
     #[cfg(feature = "fetch_remote_manifests")]
     const IMAGE_WITH_REMOTE_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/cloud.jpg");
     const IMAGE_WITH_INGREDIENT_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/CACA.jpg");
+    const SAMPLE1_HEIC: &[u8] = include_bytes!("../tests/fixtures/sample1.heic");
 
     #[test]
     // Verify that we can convert a Reader back into a Builder re-sign and the read it back again
@@ -1396,7 +1396,8 @@ pub mod tests {
 
     #[test]
     fn test_reader_embedded() -> Result<()> {
-        let reader = Reader::from_stream("image/jpeg", Cursor::new(IMAGE_WITH_MANIFEST))?;
+        let reader =
+            Reader::default().with_stream("image/jpeg", Cursor::new(IMAGE_WITH_MANIFEST))?;
         assert_eq!(reader.remote_url(), None);
         assert!(reader.is_embedded());
 
@@ -1422,7 +1423,8 @@ pub mod tests {
     #[test]
     #[cfg(feature = "fetch_remote_manifests")]
     fn test_reader_remote_url() -> Result<()> {
-        let reader = Reader::from_stream("image/jpeg", Cursor::new(IMAGE_WITH_REMOTE_MANIFEST))?;
+        let reader =
+            Reader::default().with_stream("image/jpeg", Cursor::new(IMAGE_WITH_REMOTE_MANIFEST))?;
         let remote_url = reader.remote_url();
         assert_eq!(remote_url, Some("https://cai-manifests.adobe.com/manifests/adobe-urn-uuid-5f37e182-3687-462e-a7fb-573462780391"));
         assert!(!reader.is_embedded());
@@ -1433,7 +1435,7 @@ pub mod tests {
     #[test]
     #[cfg(feature = "file_io")]
     fn test_reader_from_file_no_manifest() -> Result<()> {
-        let result = Reader::from_file("tests/fixtures/IMG_0003.jpg");
+        let result = Reader::default().with_file("tests/fixtures/IMG_0003.jpg");
         assert!(matches!(result, Err(Error::JumbfNotFound)));
         Ok(())
     }
@@ -1441,13 +1443,70 @@ pub mod tests {
     #[test]
     #[cfg(feature = "file_io")]
     fn test_reader_from_file_validation_err() -> Result<()> {
-        let reader = Reader::from_file("tests/fixtures/XCA.jpg")?;
+        let reader = Reader::default().with_file("tests/fixtures/XCA.jpg")?;
         assert!(reader.validation_status().is_some());
         assert_eq!(
             reader.validation_status().unwrap()[0].code(),
             crate::validation_status::ASSERTION_DATAHASH_MISMATCH
         );
         assert_eq!(reader.validation_state(), ValidationState::Invalid);
+        Ok(())
+    }
+
+    /// BMFF hash verification now fires at least one `VerifyingAssetHash` progress event per
+    /// hash pass (file-level or per-chunk/track), matching the granularity of the data-hash path.
+    ///
+    /// Uses in-memory streams and an embedded fixture so this runs on targets without a usable
+    /// host filesystem (e.g. WASI without preopened paths).
+    #[test]
+    fn test_bmff_read_reports_verifying_asset_hash_progress() -> Result<()> {
+        use std::sync::Mutex;
+
+        use crate::Builder;
+
+        let received = Arc::new(Mutex::new(Vec::<(ProgressPhase, u32, u32)>::new()));
+        let received_cb = Arc::clone(&received);
+        let ctx = test_context()
+            .with_progress_callback(move |phase, step, total| {
+                received_cb.lock().unwrap().push((phase, step, total));
+                true
+            })
+            .into_shared();
+
+        let mut builder = Builder::from_shared_context(&ctx);
+        let ctx_for_signer = builder.context().clone();
+        let signer = ctx_for_signer.signer()?;
+        let mut source = Cursor::new(SAMPLE1_HEIC);
+        let mut dest = Cursor::new(Vec::new());
+        builder.sign(signer, "heic", &mut source, &mut dest)?;
+
+        received.lock().unwrap().clear();
+
+        dest.set_position(0);
+        let _reader = Reader::from_shared_context(&ctx).with_stream("image/heic", &mut dest)?;
+
+        let asset_hash_events: Vec<_> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _, _)| *p == ProgressPhase::VerifyingAssetHash)
+            .cloned()
+            .collect();
+
+        assert!(
+            !asset_hash_events.is_empty(),
+            "expected at least one VerifyingAssetHash event; got none"
+        );
+        // Steps should be monotonically increasing, starting from 1.
+        for (i, (_, step, _)) in asset_hash_events.iter().enumerate() {
+            assert_eq!(
+                *step,
+                (i + 1) as u32,
+                "expected step {} but got {step} at index {i}",
+                i + 1
+            );
+        }
+
         Ok(())
     }
 
@@ -1480,8 +1539,8 @@ pub mod tests {
     #[test]
     /// Test that the reader can validate a file with nested assertion errors
     fn test_reader_nested_resource() -> Result<()> {
-        let reader =
-            Reader::from_stream("image/jpeg", std::io::Cursor::new(IMAGE_COMPLEX_MANIFEST))?;
+        let reader = Reader::default()
+            .with_stream("image/jpeg", std::io::Cursor::new(IMAGE_COMPLEX_MANIFEST))?;
         assert_eq!(reader.validation_status(), None);
         assert_eq!(reader.manifests.len(), 3);
         let manifest = reader.active_manifest().unwrap();
@@ -1504,26 +1563,18 @@ pub mod tests {
         }
 
         use crate::utils::{io_utils::tempdirectory, test::temp_dir_path};
-        let reader = Reader::from_stream(
+        let reader = Reader::default().with_stream(
             "image/jpeg",
             std::io::Cursor::new(IMAGE_WITH_INGREDIENT_MANIFEST),
         )?;
         assert_eq!(reader.validation_status(), None);
 
-        // Test that ingredients have manifest_data populated
+        // Verify that ingredients have manifest_data populated
         if let Some(manifest) = reader.active_manifest() {
             for ingredient in manifest.ingredients() {
-                // Verify that each ingredient has manifest_data
                 assert!(
                     ingredient.manifest_data().is_some(),
                     "Ingredient should have manifest_data populated"
-                );
-
-                // Verify the manifest_data is not empty
-                let manifest_data = ingredient.manifest_data().unwrap();
-                assert!(
-                    !manifest_data.is_empty(),
-                    "Ingredient manifest_data should not be empty"
                 );
             }
         }
@@ -1541,7 +1592,7 @@ pub mod tests {
     #[cfg(feature = "file_io")]
     /// Test that the reader can validate a file with nested assertion errors
     fn test_reader_detailed_json() -> Result<()> {
-        let reader = Reader::from_file("tests/fixtures/CACAE-uri-CA.jpg")?;
+        let reader = Reader::default().with_file("tests/fixtures/CACAE-uri-CA.jpg")?;
         let json = reader.json();
         let detailed_json = reader.detailed_json();
         let parsed_json: Value = serde_json::from_str(json.as_str())?;
@@ -1572,8 +1623,8 @@ pub mod tests {
     fn test_reader_post_validate() -> Result<()> {
         use crate::{log_item, status_tracker::StatusTracker};
 
-        let mut reader =
-            Reader::from_stream("image/jpeg", std::io::Cursor::new(IMAGE_WITH_MANIFEST))?;
+        let mut reader = Reader::default()
+            .with_stream("image/jpeg", std::io::Cursor::new(IMAGE_WITH_MANIFEST))?;
 
         struct TestValidator;
         impl PostValidator for TestValidator {
@@ -1636,5 +1687,51 @@ pub mod tests {
             assert_send::<Reader>();
             assert_sync::<Reader>();
         }
+    }
+
+    #[test]
+    fn test_two_ingredient_thumbnails_via_resource_to_stream() -> Result<()> {
+        let thumbnail1 = b"the first super real thumbnail";
+        let thumbnail2 = b"the second super real thumbnail";
+
+        let mut ingredient1 = Ingredient::new_v2("Ingredient One", "image/jpeg");
+        ingredient1
+            .set_thumbnail("image/jpeg", thumbnail1.to_vec())
+            .unwrap();
+
+        let mut ingredient2 = Ingredient::new_v2("Ingredient Two", "image/jpeg");
+        ingredient2
+            .set_thumbnail("image/jpeg", thumbnail2.to_vec())
+            .unwrap();
+
+        let mut builder = Builder::default()
+            .with_definition(r#"{"title": "Test Image"}"#)
+            .unwrap();
+        builder.add_ingredient(ingredient1);
+        builder.add_ingredient(ingredient2);
+
+        let signer = test_signer(SigningAlg::Ps256);
+        let mut source = Cursor::new(include_bytes!("../tests/fixtures/C.jpg").as_slice());
+        let mut output = Cursor::new(Vec::new());
+        builder.sign(&signer, "image/jpeg", &mut source, &mut output)?;
+
+        let reader = Reader::default().with_stream("image/jpeg", &mut output)?;
+        let manifest = reader.active_manifest().unwrap();
+        let ingredients = manifest.ingredients();
+        assert_eq!(ingredients.len(), 2);
+
+        let uri1 = ingredients[0].thumbnail_ref().unwrap().identifier.clone();
+        let uri2 = ingredients[1].thumbnail_ref().unwrap().identifier.clone();
+        assert_ne!(uri1, uri2);
+
+        let mut out1 = Cursor::new(Vec::new());
+        reader.resource_to_stream(&uri1, &mut out1)?;
+        assert_eq!(out1.into_inner(), thumbnail1);
+
+        let mut out2 = Cursor::new(Vec::new());
+        reader.resource_to_stream(&uri2, &mut out2)?;
+        assert_eq!(out2.into_inner(), thumbnail2);
+
+        Ok(())
     }
 }

@@ -14,8 +14,8 @@
 
 /// Tool to display and create C2PA manifests.
 ///
-/// A file path to an asset must be provided. If only the path
-/// is given, this will generate a summary report of any claims
+/// A file path to an asset is required for normal commands (not for `init`).
+/// If only the path is given, this will generate a summary report of any claims
 /// in that file. If a manifest definition JSON file is specified,
 /// the claim will be added to any existing claims.
 use std::{
@@ -24,14 +24,17 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use c2pa::{
     format_from_path, identity::validator::CawgValidator, settings::Settings, Builder,
-    ClaimGeneratorInfo, Error, Ingredient, ManifestDefinition, Reader, Signer,
+    ClaimGeneratorInfo, Context as C2paContext, Error, Ingredient, ManifestDefinition, Reader,
+    Signer,
 };
 use clap::{Parser, Subcommand};
+use env_logger::Env;
 use etcetera::BaseStrategy;
 use log::debug;
 use serde::Deserialize;
@@ -56,9 +59,30 @@ mod tree;
 mod callback_signer;
 mod signer;
 
+/// Official C2PA conformance trust list (PEM bundle).
+const TRUST_LIST_OFFICIAL_URL: &str =
+    "https://raw.githubusercontent.com/c2pa-org/conformance-public/refs/heads/main/trust-list/C2PA-TRUST-LIST.pem";
+/// Legacy interim trust anchors (PEM), fetched only with `init trust --legacy`.
+const TRUST_LIST_LEGACY_ANCHORS_URL: &str = "https://contentcredentials.org/trust/anchors.pem";
+const TRUST_LEGACY_STORE_CFG_URL: &str = "https://contentcredentials.org/trust/store.cfg";
+const TRUST_LEGACY_ALLOWED_URL: &str = "https://contentcredentials.org/trust/allowed.sha256.txt";
+
+/// Sidecar trust files stored next to the settings file (`--settings` parent directory).
+const SIDECAR_TRUST_LIST_PEM: &str = "c2pa-trust-list.pem";
+const SIDECAR_TRUST_LIST_LEGACY_PEM: &str = "c2pa-trust-list-legacy.pem";
+const SIDECAR_TRUST_STORE_CFG: &str = "c2pa-trust-store.cfg";
+const SIDECAR_TRUST_ALLOWED: &str = "c2pa-trust-allowed.sha256.txt";
+
 /// Tool for displaying and creating C2PA manifests.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, arg_required_else_help(true))]
+#[command(
+    author,
+    version,
+    about,
+    long_about = None,
+    arg_required_else_help(true),
+    subcommand_negates_reqs = true
+)]
 struct CliArgs {
     /// Path to manifest definition JSON file.
     #[clap(short, long, requires = "output")]
@@ -77,15 +101,19 @@ struct CliArgs {
     config: Option<String>,
 
     /// Display detailed C2PA-formatted manifest data.
-    #[clap(short, long)]
+    #[clap(short, long, conflicts_with = "crjson")]
     detailed: bool,
+
+    /// Output manifest data in crJSON format.
+    #[clap(long, conflicts_with = "detailed")]
+    crjson: bool,
 
     /// Force overwrite of output if it already exists.
     #[clap(short, long)]
     force: bool,
 
-    /// The path to an asset to examine or embed a manifest into.
-    path: PathBuf,
+    /// Path to an asset (omit for `init` only).
+    path: Option<PathBuf>,
 
     /// Embed remote URL manifest reference.
     #[clap(short, long)]
@@ -117,6 +145,11 @@ struct CliArgs {
     #[clap(long = "no_signing_verify")]
     no_signing_verify: bool,
 
+    /// Do not use Brotli-compressed manifest store (`c2cm`). Compression is preferred by
+    /// default when supported. Equivalent to `core.prefer_compress_manifests = false` in settings.
+    #[clap(long = "no-compress-manifest")]
+    no_compress_manifest: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -128,25 +161,7 @@ struct CliArgs {
     #[clap(long)]
     signer_path: Option<PathBuf>,
 
-    /// To be used with the [callback_signer] argument. This value should at least: size of CoseSign1 CBOR +
-    /// the size of certificate chain provided in the manifest definition's `sign_cert` field + the size of the
-    /// signature of the Time Stamp Authority response. A typical size of CoseSign1 CBOR is in the 1-2K range. If
-    /// the reserve size is too small an error will be returned during signing.
-    /// For example:
-    ///
-    /// The reserve-size can be calculated like this if you aren't including a `tsa_url` key in
-    /// your manifest description:
-    ///
-    ///     1024 + sign_cert.len()
-    ///
-    /// Or, if you are including a `tsa_url` in your manifest definition, you will calculate the
-    /// reserve size like this:
-    ///
-    ///     1024 + sign_cert.len() + tsa_signature_response.len()
-    ///
-    /// Note:
-    /// We'll default the `reserve-size` to a value of 20_000, if no value is provided. This
-    /// will probably leave extra `0`s of unused space. Please specify a reserve-size if possible.
+    /// Reserved buffer size for `--signer-path` signing only.
     #[clap(long, default_value("20000"))]
     reserve_size: usize,
 
@@ -186,10 +201,25 @@ fn parse_resource_string(s: &str) -> Result<TrustResource> {
     }
 }
 
+#[derive(Debug, Subcommand)]
+enum InitCmd {
+    /// Fetch trust PEM/config sidecars next to `--settings` (no PATH required).
+    Trust {
+        /// Also fetch legacy interim anchors, store config, and allowed list (separate files).
+        #[arg(long)]
+        legacy: bool,
+    },
+}
+
 // We only construct one per invocation, not worth shrinking this.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Bootstrap files beside `--settings` (trust lists, …).
+    Init {
+        #[command(subcommand)]
+        cmd: InitCmd,
+    },
     /// Sub-command to configure trust store options, "trust --help for more details"
     Trust {
         /// URL or path to file containing list of trust anchors in PEM format
@@ -308,8 +338,9 @@ enum Commands {
 #[derive(Debug, Default, Deserialize)]
 // Add fields that are not part of the standard Manifest
 struct ManifestDef {
+    // Flattened into the JSON root; the field is not read directly after deserialize.
     #[serde(flatten)]
-    manifest: ManifestDefinition,
+    _manifest: ManifestDefinition,
     // allows adding ingredients with file paths
     ingredient_paths: Option<Vec<PathBuf>>,
 }
@@ -320,6 +351,9 @@ fn special_errs(e: c2pa::Error) -> anyhow::Error {
         Error::JumbfNotFound => anyhow!("No claim found"),
         Error::FileNotFound(name) => anyhow!("File not found: {name}"),
         Error::UnsupportedType => anyhow!("Unsupported file type"),
+        Error::XmpNotSupported => {
+            anyhow!("Format does not support XMP; cannot embed a remote URL reference")
+        }
         Error::PrereleaseError => anyhow!("Prerelease claim found"),
         _ => e.into(),
     }
@@ -358,7 +392,9 @@ fn load_ingredient(path: &Path) -> Result<Ingredient> {
         }
         Ok(ingredient)
     } else {
-        Ok(Ingredient::from_file(path)?)
+        #[allow(deprecated)]
+        let result = Ingredient::from_file(path)?;
+        Ok(result)
     }
 }
 
@@ -473,12 +509,160 @@ fn blocking_get(url: &str) -> Result<String> {
     }
 }
 
-fn configure_sdk(args: &CliArgs) -> Result<()> {
-    if args.settings.exists() {
-        Settings::from_file(&args.settings)?;
+/// Write `contents` to `dest` atomically: temp file in the same directory, fsync, then rename.
+/// If `dest` already exists it is replaced without truncating in place (best-effort crash safety).
+fn atomic_write_file(dest: &Path, contents: &[u8]) -> Result<()> {
+    let parent = dest
+        .parent()
+        .context("destination path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let stem = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("c2pa-trust");
+    let tmp = parent.join(format!(".{stem}.{}.tmp", std::process::id()));
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    if cfg!(windows) && dest.exists() {
+        fs::remove_file(dest)?;
+    }
+    fs::rename(&tmp, dest)
+        .with_context(|| format!("atomic rename {} -> {}", tmp.display(), dest.display()))?;
+    Ok(())
+}
+
+/// Load trust PEM/config sidecars from the same directory as `--settings`, if present.
+/// Returns whether any trust material was applied (for enabling `verify_trust`).
+fn apply_trust_sidecars(settings: &mut Settings, settings_path: &Path) -> Result<bool> {
+    let Some(dir) = settings_path.parent() else {
+        return Ok(false);
+    };
+    let mut applied = false;
+
+    let official = dir.join(SIDECAR_TRUST_LIST_PEM);
+    if official.exists() {
+        let data = fs::read_to_string(&official)
+            .with_context(|| format!("read trust sidecar {}", official.display()))?;
+        settings.update_from_str(
+            &toml::toml! {
+                [trust]
+                trust_anchors = data
+            }
+            .to_string(),
+            "toml",
+        )?;
+        applied = true;
     }
 
-    let mut enable_trust_checks = false;
+    let legacy_pem = dir.join(SIDECAR_TRUST_LIST_LEGACY_PEM);
+    if legacy_pem.exists() {
+        let data = fs::read_to_string(&legacy_pem)
+            .with_context(|| format!("read legacy trust sidecar {}", legacy_pem.display()))?;
+        settings.update_from_str(
+            &toml::toml! {
+                [trust]
+                user_anchors = data
+            }
+            .to_string(),
+            "toml",
+        )?;
+        applied = true;
+    }
+
+    let store_cfg = dir.join(SIDECAR_TRUST_STORE_CFG);
+    if store_cfg.exists() {
+        let data = fs::read_to_string(&store_cfg)
+            .with_context(|| format!("read trust sidecar {}", store_cfg.display()))?;
+        settings.update_from_str(
+            &toml::toml! {
+                [trust]
+                trust_config = data
+            }
+            .to_string(),
+            "toml",
+        )?;
+        applied = true;
+    }
+
+    let allowed = dir.join(SIDECAR_TRUST_ALLOWED);
+    if allowed.exists() {
+        let data = fs::read_to_string(&allowed)
+            .with_context(|| format!("read trust sidecar {}", allowed.display()))?;
+        settings.update_from_str(
+            &toml::toml! {
+                [trust]
+                allowed_list = data
+            }
+            .to_string(),
+            "toml",
+        )?;
+        applied = true;
+    }
+
+    Ok(applied)
+}
+
+fn run_trust_init(legacy: bool, settings_path: &Path) -> Result<()> {
+    #[cfg(target_os = "wasi")]
+    {
+        bail!("`init trust` is not supported on this target (network fetch unavailable)");
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let dir = settings_path
+            .parent()
+            .context("settings path has no parent directory")?;
+        fs::create_dir_all(dir)?;
+
+        println!("Fetching official C2PA trust list...");
+        let official = load_trust_resource(&TrustResource::Url(
+            Url::parse(TRUST_LIST_OFFICIAL_URL).expect("constant URL"),
+        ))?;
+        let dest = dir.join(SIDECAR_TRUST_LIST_PEM);
+        atomic_write_file(&dest, official.as_bytes())?;
+        println!("Wrote {}", dest.display());
+
+        if legacy {
+            println!("Fetching legacy interim trust material...");
+            let leg = load_trust_resource(&TrustResource::Url(
+                Url::parse(TRUST_LIST_LEGACY_ANCHORS_URL).expect("constant URL"),
+            ))?;
+            atomic_write_file(&dir.join(SIDECAR_TRUST_LIST_LEGACY_PEM), leg.as_bytes())?;
+
+            let cfg = load_trust_resource(&TrustResource::Url(
+                Url::parse(TRUST_LEGACY_STORE_CFG_URL).expect("constant URL"),
+            ))?;
+            atomic_write_file(&dir.join(SIDECAR_TRUST_STORE_CFG), cfg.as_bytes())?;
+
+            let allowed = load_trust_resource(&TrustResource::Url(
+                Url::parse(TRUST_LEGACY_ALLOWED_URL).expect("constant URL"),
+            ))?;
+            atomic_write_file(&dir.join(SIDECAR_TRUST_ALLOWED), allowed.as_bytes())?;
+
+            println!("Wrote legacy sidecars under {}", dir.display());
+        }
+
+        println!(
+            "Trust sidecars are loaded automatically on the next run (same directory as {}).",
+            settings_path.display()
+        );
+        Ok(())
+    }
+}
+
+fn configure_sdk(args: &CliArgs) -> Result<Settings> {
+    let mut settings = if args.settings.exists() {
+        Settings::new().with_file(&args.settings)?
+    } else {
+        Settings::default()
+    };
+
+    let sidecar_trust = apply_trust_sidecars(&mut settings, &args.settings)?;
+
+    let mut enable_trust_checks = sidecar_trust;
 
     if let Some(Commands::Trust {
         trust_anchors,
@@ -490,12 +674,13 @@ fn configure_sdk(args: &CliArgs) -> Result<()> {
             debug!("Using trust anchors from {trust_list:?}");
 
             let data = load_trust_resource(trust_list)?;
-            Settings::from_toml(
+            settings.update_from_str(
                 &toml::toml! {
                     [trust]
                     trust_anchors = data
                 }
                 .to_string(),
+                "toml",
             )?;
 
             enable_trust_checks = true;
@@ -505,12 +690,13 @@ fn configure_sdk(args: &CliArgs) -> Result<()> {
             debug!("Using allowed list from {allowed_list:?}");
 
             let data = load_trust_resource(allowed_list)?;
-            Settings::from_toml(
+            settings.update_from_str(
                 &toml::toml! {
                     [trust]
                     allowed_list = data
                 }
                 .to_string(),
+                "toml",
             )?;
 
             enable_trust_checks = true;
@@ -520,91 +706,105 @@ fn configure_sdk(args: &CliArgs) -> Result<()> {
             debug!("Using trust config from {trust_config:?}");
 
             let data = load_trust_resource(trust_config)?;
-            Settings::from_toml(
+            settings.update_from_str(
                 &toml::toml! {
                     [trust]
                     trust_config = data
                 }
                 .to_string(),
+                "toml",
             )?;
 
             enable_trust_checks = true;
         }
     }
 
-    // if any trust setting is provided enable the trust checks
-    // there is no disabling of default setting only the ability to enable if they were internally disabled
+    // If trust material came from CLI or sidecars, enable trust checks (cannot disable defaults).
     if enable_trust_checks {
-        Settings::from_toml(
+        settings.update_from_str(
             &toml::toml! {
                 [verify]
                 verify_trust = true
             }
             .to_string(),
+            "toml",
         )?;
     }
 
-    // enable or disable verification after signing
-    {
-        Settings::from_toml(
-            &toml::toml! {
-                [trust]
-                verify_after_sign = (!args.no_signing_verify)
-            }
-            .to_string(),
+    if args.no_compress_manifest {
+        settings.update_from_str(
+            r#"
+            [core]
+            prefer_compress_manifests = false
+            "#,
+            "toml",
         )?;
     }
 
-    Ok(())
+    if args.no_signing_verify {
+        settings.update_from_str(
+            r#"
+            [verify]
+            verify_after_sign = false
+            "#,
+            "toml",
+        )?;
+    }
+
+    Ok(settings)
 }
 
 fn sign_fragmented(
     builder: &mut Builder,
     signer: &dyn Signer,
     init_pattern: &Path,
-    frag_pattern: &PathBuf,
+    frag_pattern: &Path,
     output_path: &Path,
+    sidecar: bool,
+    remote_url: Option<&str>,
 ) -> Result<()> {
     // search folders for init segments
     let ip = init_pattern.to_str().ok_or(c2pa::Error::OtherError(
         "could not parse source pattern".into(),
     ))?;
-    let inits = glob::glob(ip).context("could not process glob pattern")?;
-    let mut count = 0;
-    for init in inits {
-        match init {
-            Ok(p) => {
-                let mut fragments = Vec::new();
-                let init_dir = p.parent().context("init segment had no parent dir")?;
-                let seg_glob = init_dir.join(frag_pattern); // segment match pattern
+    let inits: Vec<_> = glob::glob(ip)
+        .context("could not process glob pattern")?
+        .collect::<Result<_, _>>()?;
 
-                // grab the fragments that go with this init segment
-                let seg_glob_str = seg_glob.to_str().context("fragment path not valid")?;
-                let seg_paths = glob::glob(seg_glob_str).context("fragment glob not valid")?;
-                for seg in seg_paths {
-                    match seg {
-                        Ok(f) => fragments.push(f),
-                        Err(_) => return Err(anyhow!("fragment path not valid")),
-                    }
-                }
+    if inits.is_empty() {
+        println!("No files matching pattern: {ip}");
+        return Ok(());
+    }
 
-                println!("Adding manifest to: {p:?}");
-                let new_output_path =
-                    output_path.join(init_dir.file_name().context("invalid file name")?);
-                builder.sign_fragmented_files(signer, &p, &fragments, &new_output_path)?;
+    let jumbf =
+        builder.sign_fragmented_files(signer, init_pattern, frag_pattern, output_path)?;
 
-                count += 1;
+    if sidecar || remote_url.is_some() {
+        for p in inits {
+            let init_dir = p.parent().context("init segment had no parent dir")?;
+            let new_output_path =
+                output_path.join(init_dir.file_name().context("invalid file name")?);
+            let sidecar_path = new_output_path
+                .join(p.file_stem().unwrap_or_default())
+                .with_extension("c2pa");
+            std::fs::write(&sidecar_path, &jumbf)?;
+            if let Some(url) = remote_url {
+                println!(
+                    "Manifest written to {:?} - upload to {} to complete remote manifest",
+                    sidecar_path, url
+                );
             }
-            Err(_) => bail!("bad path to init segment"),
         }
     }
-    if count == 0 {
-        println!("No files matching pattern: {ip}");
-    }
+
     Ok(())
 }
 
-fn verify_fragmented(init_pattern: &Path, frag_pattern: &Path) -> Result<Vec<Reader>> {
+fn verify_fragmented(
+    init_pattern: &Path,
+    frag_pattern: &Path,
+    context: &Arc<C2paContext>,
+) -> Result<Vec<Reader>> {
     let mut readers = Vec::new();
 
     let ip = init_pattern
@@ -632,11 +832,11 @@ fn verify_fragmented(init_pattern: &Path, frag_pattern: &Path) -> Result<Vec<Rea
                 }
 
                 println!("Verifying manifest: {p:?}");
-                let reader = Reader::from_fragmented_files(p, &fragments)?;
+                let reader =
+                    Reader::from_shared_context(context).with_fragmented_files(p, &fragments)?;
                 if let Some(vs) = reader.validation_status() {
-                    if let Some(e) = vs.iter().find(|v| !v.passed()) {
-                        eprintln!("Error validating segments: {e:?}");
-                        return Ok(readers);
+                    for e in vs.iter().filter(|v| !v.passed()) {
+                        eprintln!("Validation error: {e:?}");
                     }
                 }
 
@@ -669,28 +869,35 @@ fn validate_cawg(reader: &mut Reader) -> Result<()> {
     }
 }
 
-fn reader_from_args(args: &CliArgs) -> Result<Reader> {
+fn reader_from_args(
+    asset_path: &Path,
+    args: &CliArgs,
+    context: &Arc<C2paContext>,
+) -> Result<Reader> {
     if let Some(external_manifest) = &args.external_manifest {
         let c2pa_data = fs::read(external_manifest)?;
-        let format = match c2pa::format_from_path(&args.path) {
+        let format = match c2pa::format_from_path(asset_path) {
             Some(format) => format,
             None => {
-                bail!("Format for {:?} is unrecognized", args.path);
+                bail!("Format for {:?} is unrecognized", asset_path);
             }
         };
-        Ok(
-            Reader::from_manifest_data_and_stream(&c2pa_data, &format, File::open(&args.path)?)
-                .map_err(special_errs)?,
-        )
+        Ok(Reader::from_shared_context(context)
+            .with_manifest_data_and_stream(&c2pa_data, &format, File::open(asset_path)?)
+            .map_err(special_errs)?)
     } else {
-        Ok(Reader::from_file(&args.path).map_err(special_errs)?)
+        Ok(Reader::from_shared_context(context)
+            .with_file(asset_path)
+            .map_err(special_errs)?)
     }
 }
 
 // Utility to catch reader formatting errors and print the reader json or detailed json
 // formatting can fail if Reader CBOR is deeply nested or malformed
-fn print_reader(reader: &Reader, detailed: bool) -> Result<()> {
-    let result = if detailed {
+fn print_reader(reader: &Reader, detailed: bool, crjson: bool) -> Result<()> {
+    let result = if crjson {
+        reader.crjson_checked()
+    } else if detailed {
         reader.detailed_json_checked()
     } else {
         reader.json_checked()
@@ -705,23 +912,39 @@ fn print_reader(reader: &Reader, detailed: bool) -> Result<()> {
     }
 }
 
+/// True when `--output` is suitable for folder-style use (e.g. `--ingredient` to a report dir,
+/// or manifest report to a directory). A missing path is allowed (`create_dir_all` will make it);
+/// an existing path must be a directory (names like `v1.0` are not inferred from a dot in the
+/// last component).
+pub(crate) fn folder_mode_output_path_ok(path: &Path) -> bool {
+    !path.exists() || path.is_dir()
+}
+
 fn main() -> Result<()> {
     let args = CliArgs::parse();
 
-    // set RUST_LOG=debug to get detailed debug logging
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "error");
-    }
-    env_logger::init();
+    // default to error logging, RUST_LOG=debug to get detailed debug logging
+    env_logger::Builder::from_env(Env::default().default_filter_or("error")).init();
 
-    let path = &args.path;
+    if let Some(Commands::Init { cmd }) = &args.command {
+        return match cmd {
+            InitCmd::Trust { legacy } => run_trust_init(*legacy, &args.settings),
+        };
+    }
+
+    let path = args
+        .path
+        .as_ref()
+        .context("PATH to an asset is required (omit only for `init`)")?;
 
     if args.info {
         return info(path);
     }
 
     if args.cert_chain {
-        let reader = Reader::from_file(path).map_err(special_errs)?;
+        let reader = Reader::from_context(C2paContext::new())
+            .with_file(path)
+            .map_err(special_errs)?;
         // todo: add cawg certs here??
         if let Some(manifest) = reader.active_manifest() {
             if let Some(si) = manifest.signature_info() {
@@ -744,13 +967,14 @@ fn main() -> Result<()> {
     );
 
     // configure the SDK
-    configure_sdk(&args).context("Could not configure c2pa-rs")?;
+    let mut settings = configure_sdk(&args).context("Could not configure c2pa-rs")?;
+    let context = Arc::new(C2paContext::new().with_settings(&settings)?);
 
     if let Some(Commands::LiveVideo {
         segments_glob: Some(sg),
     }) = &args.command
     {
-        return live_video::validate_live_video(&args.path, sg);
+        return live_video::validate_live_video(path, sg);
     } else if matches!(&args.command, Some(Commands::LiveVideo { segments_glob: None })) {
         bail!("segments_glob must be set for the live-video subcommand");
     }
@@ -768,10 +992,15 @@ fn main() -> Result<()> {
         let manifest_json = std::fs::read_to_string(manifest)
             .with_context(|| format!("Failed to read manifest file: {manifest:?}"))?;
         let sign_config = signer::SignConfig::from_json(&manifest_json)?;
-        let signer = match Settings::signer() {
-            Ok(s) => s,
-            Err(Error::MissingSignerSettings) => sign_config.signer()?,
-            Err(err) => return Err(err.into()),
+        let signer = if let Some(signer_cfg) = settings.signer.take() {
+            let c2pa_signer = signer_cfg.c2pa_signer()?;
+            if let Some(cawg_cfg) = settings.cawg_x509_signer.take() {
+                cawg_cfg.cawg_signer(c2pa_signer)?
+            } else {
+                c2pa_signer
+            }
+        } else {
+            sign_config.signer()?
         };
 
         if method == "vsi" {
@@ -780,7 +1009,7 @@ fn main() -> Result<()> {
                     if p.is_absolute() {
                         p.to_path_buf()
                     } else {
-                        args.path.join(p)
+                        path.join(p)
                     }
                 }
                 None => bail!("--init is required when using --method vsi"),
@@ -788,7 +1017,7 @@ fn main() -> Result<()> {
             let session_key_path = session_key.as_deref()
                 .ok_or_else(|| anyhow!("--session-key is required when using --method vsi"))?;
             return live_video_sign::sign_live_video_vsi(
-                &args.path,
+                path,
                 segments_glob,
                 &init_path,
                 previous_segment.as_deref(),
@@ -803,11 +1032,11 @@ fn main() -> Result<()> {
             if p.is_absolute() {
                 p.to_path_buf()
             } else {
-                args.path.join(p)
+                path.join(p)
             }
         });
         return live_video_sign::sign_live_video(
-            &args.path,
+            path,
             segments_glob,
             init_path.as_deref(),
             previous_segment.as_deref(),
@@ -857,19 +1086,17 @@ fn main() -> Result<()> {
 
         // read the manifest information
         let manifest_def: ManifestDef = serde_json::from_slice(json.as_bytes())?;
-        let mut builder = Builder::from_json(&json)?;
-        let mut manifest = manifest_def.manifest;
+        let mut builder = Builder::from_shared_context(&context).with_definition(&json)?;
 
         // add claim_tool generator so we know this was created using this tool
         let mut tool_generator = ClaimGeneratorInfo::new(env!("CARGO_PKG_NAME"));
         tool_generator.set_version(env!("CARGO_PKG_VERSION"));
-        if !manifest.claim_generator_info.is_empty()
-            || manifest.claim_generator_info[0].name == "c2pa-rs"
+        if builder.definition.claim_generator_info.is_empty()
+            || builder.definition.claim_generator_info[0].name == "c2pa-rs"
         {
-            manifest.claim_generator_info = vec![tool_generator];
-        } else {
-            manifest.claim_generator_info.insert(1, tool_generator);
+            builder.definition.claim_generator_info = vec![tool_generator];
         }
+        // else: user supplied a custom `claim_generator_info` (v2 allows only one); keep it
 
         // set manifest base path before ingredients so ingredients can override it
         if let Some(base) = base_path.as_ref() {
@@ -901,12 +1128,16 @@ fn main() -> Result<()> {
         // note: This could be treated as an update manifest eventually since the image is the same
         let has_parent = builder.definition.ingredients.iter().any(|i| i.is_parent());
         if !has_parent && !is_fragment {
-            let mut source_ingredient = Ingredient::from_file(&args.path)?;
+            #[allow(deprecated)]
+            let mut source_ingredient = Ingredient::from_file(path)?;
             if source_ingredient.manifest_data().is_some() {
                 source_ingredient.set_is_parent();
                 builder.add_ingredient(source_ingredient);
             }
         }
+
+        let sign_sidecar = args.sidecar;
+        let sign_remote_url = args.remote.clone();
 
         if let Some(remote) = args.remote {
             if args.sidecar {
@@ -929,12 +1160,15 @@ fn main() -> Result<()> {
             let signer = CallbackSigner::new(process_runner, cb_config);
 
             Box::new(signer)
-        } else {
-            match Settings::signer() {
-                Ok(signer) => signer,
-                Err(Error::MissingSignerSettings) => sign_config.signer()?,
-                Err(err) => Err(err)?,
+        } else if let Some(signer_cfg) = settings.signer.take() {
+            let c2pa_signer = signer_cfg.c2pa_signer()?;
+            if let Some(cawg_cfg) = settings.cawg_x509_signer.take() {
+                cawg_cfg.cawg_signer(c2pa_signer)?
+            } else {
+                c2pa_signer
             }
+        } else {
+            sign_config.signer()?
         };
 
         if let Some(output) = args.output {
@@ -945,16 +1179,24 @@ fn main() -> Result<()> {
                 }
 
                 if let Some(fg) = &fragments_glob {
-                    return sign_fragmented(&mut builder, signer.as_ref(), &args.path, fg, &output);
+                    return sign_fragmented(
+                        &mut builder,
+                        signer.as_ref(),
+                        path,
+                        fg,
+                        &output,
+                        sign_sidecar,
+                        sign_remote_url.as_deref(),
+                    );
                 } else {
                     bail!("fragments_glob must be set");
                 }
             } else {
-                if ext_normal(&output) != ext_normal(&args.path) {
+                if ext_normal(&output) != ext_normal(path) {
                     bail!("Output type must match source type");
                 }
                 if output.exists() {
-                    if args.force && output != args.path {
+                    if args.force && output != *path {
                         remove_file(&output)?;
                     } else if !args.force {
                         bail!("Output already exists; use -f/force to force write");
@@ -967,14 +1209,16 @@ fn main() -> Result<()> {
                     bail!("Missing extension output");
                 }
 
-                let manifest_data = if args.path != output {
+                let manifest_data = if *path != output {
                     builder
-                        .sign_file(signer.as_ref(), &args.path, &output)
+                        .sign_file(signer.as_ref(), path, &output)
                         .context("embedding manifest")?
                 } else {
                     let mut file = NamedTempFile::new()?;
-                    let format = format_from_path(&args.path).unwrap();
-                    let mut source = File::open(&args.path)?;
+                    let format = format_from_path(path)
+                        .ok_or(c2pa::Error::UnsupportedType)
+                        .context("unsupported file type")?;
+                    let mut source = File::open(path)?;
                     if builder.definition.title.is_none() {
                         if let Some(title) = output.file_name() {
                             builder.definition.title = Some(title.to_string_lossy().to_string());
@@ -1007,10 +1251,28 @@ fn main() -> Result<()> {
                     file.write_all(&manifest_data)?;
                 }
 
-                // generate a report on the output file
-                let mut reader = Reader::from_file(&output).map_err(special_errs)?;
-                validate_cawg(&mut reader)?;
-                print_reader(&reader, args.detailed)?;
+                // After signing with `--remote`, XMP points at a URL where the manifest is not
+                // uploaded yet; `Reader::with_file` would try to fetch that URL first. When we
+                // also wrote a sidecar, validate using the manifest bytes we just produced.
+                if !args.no_signing_verify {
+                    let mut reader = if args.sidecar && sign_remote_url.is_some() {
+                        let format = format_from_path(path)
+                            .or_else(|| format_from_path(&output))
+                            .ok_or(c2pa::Error::UnsupportedType)
+                            .context("unsupported file type")?;
+                        let mut out_file =
+                            File::open(&output).context("open output asset for validation")?;
+                        Reader::from_shared_context(&context)
+                            .with_manifest_data_and_stream(&manifest_data, &format, &mut out_file)
+                            .map_err(special_errs)?
+                    } else {
+                        Reader::from_shared_context(&context)
+                            .with_file(&output)
+                            .map_err(special_errs)?
+                    };
+                    validate_cawg(&mut reader)?;
+                    print_reader(&reader, args.detailed, args.crjson)?;
+                }
             }
         } else {
             bail!("Output path required with manifest definition")
@@ -1018,7 +1280,7 @@ fn main() -> Result<()> {
     } else if args.parent.is_some() || args.sidecar || args.remote.is_some() {
         bail!("Manifest definition required with these options or flags")
     } else if let Some(output) = args.output {
-        if output.is_file() || output.extension().is_some() {
+        if !folder_mode_output_path_ok(&output) {
             bail!("Output must be a folder for this option.")
         }
         if output.exists() {
@@ -1030,13 +1292,16 @@ fn main() -> Result<()> {
         }
         create_dir_all(&output)?;
         if args.ingredient {
-            let report = Ingredient::from_file_with_folder(&args.path, &output)
+            #[allow(deprecated)]
+            let report = Ingredient::from_file_with_folder(path, &output)
                 .map_err(special_errs)?
                 .to_string();
             File::create(output.join("ingredient.json"))?.write_all(&report.into_bytes())?;
             println!("Ingredient report written to the directory {:?}", &output);
         } else {
-            let mut reader = Reader::from_file(&args.path).map_err(special_errs)?;
+            let mut reader = Reader::from_shared_context(&context)
+                .with_file(path)
+                .map_err(special_errs)?;
             validate_cawg(&mut reader)?;
             reader.to_folder(&output)?;
             let report = reader.to_string();
@@ -1050,15 +1315,14 @@ fn main() -> Result<()> {
             println!("Manifest report written to the directory {:?}", &output);
         }
     } else if args.ingredient {
-        println!(
-            "{}",
-            Ingredient::from_file(&args.path).map_err(special_errs)?
-        )
+        #[allow(deprecated)]
+        let ingredient = Ingredient::from_file(path).map_err(special_errs)?;
+        println!("{}", ingredient)
     } else if let Some(Commands::Fragment {
         fragments_glob: Some(fg),
     }) = &args.command
     {
-        let mut stores = verify_fragmented(&args.path, fg)?;
+        let mut stores = verify_fragmented(path, fg, &context)?;
         if stores.len() == 1 {
             validate_cawg(&mut stores[0])?;
             println!("{}", stores[0]);
@@ -1069,9 +1333,9 @@ fn main() -> Result<()> {
             println!("{} Init manifests validated", stores.len());
         }
     } else {
-        let mut reader = reader_from_args(&args)?;
+        let mut reader = reader_from_args(path, &args, &context)?;
         validate_cawg(&mut reader)?;
-        print_reader(&reader, args.detailed)?;
+        print_reader(&reader, args.detailed, args.crjson)?;
     }
 
     Ok(())
@@ -1081,7 +1345,9 @@ fn main() -> Result<()> {
 pub mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use c2pa::{BuilderIntent, DigitalSourceType};
+    use std::fs::{create_dir, write};
+
+    use c2pa::{BuilderIntent, DigitalSourceType, Settings};
     use tempfile::TempDir;
 
     use super::*;
@@ -1108,6 +1374,30 @@ pub mod tests {
     }
 
     #[test]
+    fn folder_mode_output_path_accepts_dir_with_dot_in_name() {
+        let tmp = tempdirectory().unwrap();
+        let p = tmp.path().join("release.v1.0");
+        create_dir(&p).unwrap();
+        assert!(folder_mode_output_path_ok(&p));
+    }
+
+    #[test]
+    fn folder_mode_output_path_accepts_nonexistent_path() {
+        let tmp = tempdirectory().unwrap();
+        let p = tmp.path().join("not_created_yet");
+        assert!(folder_mode_output_path_ok(&p));
+    }
+
+    #[test]
+    fn folder_mode_output_path_rejects_existing_file() {
+        let tmp = tempdirectory().unwrap();
+        let f = tmp.path().join("report.json");
+        write(&f, b"{}").unwrap();
+        assert!(!folder_mode_output_path_ok(&f));
+    }
+
+    #[allow(deprecated)]
+    #[test]
     fn test_manifest_config() {
         const SOURCE_PATH: &str = "tests/fixtures/earth_apollo17.jpg";
         let tempdir = tempdirectory().unwrap();
@@ -1131,5 +1421,35 @@ pub mod tests {
         println!("{ms}");
         //let ms = report_from_path(&OUTPUT_PATH, false).expect("report_from_path");
         assert!(ms.contains("my_key"));
+    }
+
+    #[test]
+    fn atomic_write_file_writes_and_replaces() {
+        let tmp = tempdirectory().unwrap();
+        let dest = tmp.path().join("out.pem");
+        atomic_write_file(&dest, b"first").unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "first");
+        atomic_write_file(&dest, b"second").unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "second");
+    }
+
+    #[test]
+    fn apply_trust_sidecars_reads_official_pem() {
+        const SAMPLE_ANCHOR_PEM: &str = include_str!("../../cli/tests/fixtures/trust/anchors.pem");
+        let tmp = tempdirectory().unwrap();
+        let settings_path = tmp.path().join("c2pa.toml");
+        write(
+            tmp.path().join(SIDECAR_TRUST_LIST_PEM),
+            SAMPLE_ANCHOR_PEM.as_bytes(),
+        )
+        .unwrap();
+        let mut settings = Settings::default();
+        assert!(apply_trust_sidecars(&mut settings, &settings_path).unwrap());
+        let ta = settings
+            .trust
+            .trust_anchors
+            .as_deref()
+            .expect("trust_anchors");
+        assert!(ta.contains("BEGIN CERTIFICATE"));
     }
 }
