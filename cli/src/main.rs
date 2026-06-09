@@ -992,10 +992,15 @@ fn main() -> Result<()> {
         let manifest_json = std::fs::read_to_string(manifest)
             .with_context(|| format!("Failed to read manifest file: {manifest:?}"))?;
         let sign_config = signer::SignConfig::from_json(&manifest_json)?;
-        let signer = match Settings::signer() {
-            Ok(s) => s,
-            Err(Error::MissingSignerSettings) => sign_config.signer()?,
-            Err(err) => return Err(err.into()),
+        let signer = if let Some(signer_cfg) = settings.signer.take() {
+            let c2pa_signer = signer_cfg.c2pa_signer()?;
+            if let Some(cawg_cfg) = settings.cawg_x509_signer.take() {
+                cawg_cfg.cawg_signer(c2pa_signer)?
+            } else {
+                c2pa_signer
+            }
+        } else {
+            sign_config.signer()?
         };
 
         if method == "vsi" {
