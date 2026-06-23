@@ -717,7 +717,7 @@ pub struct SignatureInfo {
     pub revocation_status: Option<bool>,
 
     /// The cert chain for this claim.
-    #[serde(skip)] // don't serialize this, let someone ask for it
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub cert_chain: String,
 }
 
