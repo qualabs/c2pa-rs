@@ -39,7 +39,7 @@ use crate::{
     jumbf::labels::to_assertion_uri,
     log_current_item, log_item,
     status_tracker::StatusTracker,
-    Context, Manifest, Reader,
+    Manifest, Reader,
 };
 
 /// This struct represents the raw content of the identity assertion.
@@ -295,7 +295,7 @@ impl IdentityAssertion {
         partial_claim: &PartialClaim,
         status_tracker: &mut StatusTracker,
     ) -> Result<serde_json::Value, ValidationError<String>> {
-        let settings = Context::new().settings().clone();
+        let settings = crate::settings::get_thread_local_settings();
         self.check_padding(status_tracker)?;
 
         self.signer_payload
@@ -345,8 +345,9 @@ impl IdentityAssertion {
             )
             .validation_status("cawg.identity.well-formed")
             .success(status_tracker);
-            // TO DO (CAI-7980): Should instead issue `cawg.identity.trusted` if the
-            // signing cert is found on a configured trust list.
+            // NOTE (CAI-7980): when the signing cert is on a configured CAWG trust
+            // list, `verify_signature` above additionally logs `cawg.identity.trusted`
+            // (and `cawg.identity.untrusted` when it is not).
 
             serde_json::to_value(result)
                 .map_err(|e| ValidationError::UnknownSignatureType(e.to_string()))

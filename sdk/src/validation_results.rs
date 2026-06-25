@@ -11,6 +11,8 @@
 // specific language governing permissions and limitations under
 // each license.
 
+use std::fmt::{self, Display};
+
 use chrono::Utc;
 #[cfg(feature = "json_schema")]
 use schemars::JsonSchema;
@@ -24,6 +26,23 @@ use crate::{
     store::Store,
     validation_status::{self, log_kind, ValidationStatus},
 };
+
+/// Returns `true` if `code` is an untrusted-credential failure that does not, by
+/// itself, invalidate a manifest.
+///
+/// This tolerates both the C2PA claim signer ([`SIGNING_CREDENTIAL_UNTRUSTED`])
+/// and the CAWG creator-identity credential ([`CAWG_IDENTITY_UNTRUSTED`]). CAWG
+/// identity trust is outside the scope of C2PA validity, so an untrusted CAWG
+/// identity is treated like an untrusted C2PA claim signer for the purpose of
+/// the C2PA validation state (i.e. the manifest may still be `Valid`, but never
+/// `Trusted`).
+///
+/// [`SIGNING_CREDENTIAL_UNTRUSTED`]: validation_status::SIGNING_CREDENTIAL_UNTRUSTED
+/// [`CAWG_IDENTITY_UNTRUSTED`]: validation_status::CAWG_IDENTITY_UNTRUSTED
+pub(crate) fn is_untrusted_failure(code: &str) -> bool {
+    code == validation_status::SIGNING_CREDENTIAL_UNTRUSTED
+        || code == validation_status::CAWG_IDENTITY_UNTRUSTED
+}
 
 /// Represents the levels of assurance a manifest store achieves when evaluated against the C2PA
 /// specifications structural, cryptographic, and trust requirements.
@@ -223,7 +242,7 @@ impl ValidationResults {
                 // Then check if the manifest contains either no failures or that it's only untrusted.
                 && (active_manifest.failure().is_empty()
                     || active_manifest.failure().iter().all(|status| {
-                        status.code() == validation_status::SIGNING_CREDENTIAL_UNTRUSTED
+                        is_untrusted_failure(status.code())
                     }))
                 // Finally check if the ingredients contain either no failures or the only failure is
                 // that the ingredient is untrusted.
@@ -232,7 +251,7 @@ impl ValidationResults {
                         let deltas = idv.validation_deltas();
                         deltas.failure().is_empty()
                             || deltas.failure().iter().all(|status| {
-                                status.code() == validation_status::SIGNING_CREDENTIAL_UNTRUSTED
+                                is_untrusted_failure(status.code())
                             })
                     })
                 });
@@ -359,6 +378,136 @@ impl ValidationResults {
         }
         self
     }
+
+    /// Returns a summary of why validation failed.
+    ///
+    /// The `Display` impl outputs a human-readable view of the failures, suitable for error messages.
+    /// If there are no failures, an empty string is output.
+    pub fn failure_summary(&self) -> ValidationFailureSummary<'_> {
+        ValidationFailureSummary(self)
+    }
+
+    pub(crate) fn format_status(status: &ValidationStatus, indent: &str) -> String {
+        let mut line = format!("{indent}{}", status.code());
+        if let Some(explanation) = status.explanation() {
+            line.push_str(&format!(": {explanation}"));
+        }
+        if let Some(url) = status.url() {
+            line.push_str(&format!(" ({url})"));
+        }
+        line
+    }
+}
+
+impl Display for ValidationResults {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.validation_state();
+        writeln!(f, "state: {state:?}")?;
+
+        if let Some(active_manifest) = self.active_manifest.as_ref() {
+            if !active_manifest.success.is_empty() {
+                let codes = active_manifest
+                    .success
+                    .iter()
+                    .map(|status| status.code())
+                    .collect::<Vec<_>>();
+                writeln!(f, "  success: {}", codes.join(", "))?;
+            }
+            if !active_manifest.informational.is_empty() {
+                writeln!(f, "  informational:")?;
+                for status in &active_manifest.informational {
+                    writeln!(f, "{}", ValidationResults::format_status(status, "    "))?;
+                }
+            }
+            if !active_manifest.failure.is_empty() {
+                writeln!(f, "  failure:")?;
+                for status in &active_manifest.failure {
+                    writeln!(f, "{}", ValidationResults::format_status(status, "    "))?;
+                }
+            }
+        }
+
+        if let Some(deltas) = self.ingredient_deltas.as_ref() {
+            for delta in deltas {
+                let d = delta.validation_deltas();
+                writeln!(f, "  ingredient [{}]:", delta.ingredient_assertion_uri())?;
+                if !d.success.is_empty() {
+                    let codes = d
+                        .success
+                        .iter()
+                        .map(|status| status.code())
+                        .collect::<Vec<_>>();
+                    writeln!(f, "    success: {}", codes.join(", "))?;
+                }
+                if !d.informational.is_empty() {
+                    writeln!(f, "    informational:")?;
+                    for status in &d.informational {
+                        writeln!(f, "{}", ValidationResults::format_status(status, "      "))?;
+                    }
+                }
+                if !d.failure.is_empty() {
+                    writeln!(f, "    failure:")?;
+                    for status in &d.failure {
+                        writeln!(f, "{}", ValidationResults::format_status(status, "      "))?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Concise display of why a [`ValidationResults`] is invalid (impls `Display`).
+pub struct ValidationFailureSummary<'a>(&'a ValidationResults);
+
+impl Display for ValidationFailureSummary<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let results = self.0;
+        let mut output_lines = Vec::new();
+
+        if let Some(active_manifest) = results.active_manifest.as_ref() {
+            let failures = active_manifest
+                .failure
+                .iter()
+                .filter(|status| !is_untrusted_failure(status.code()))
+                .collect::<Vec<_>>();
+            if !failures.is_empty() {
+                output_lines.push("failures:".to_string());
+                output_lines.extend(
+                    failures
+                        .iter()
+                        .map(|status| ValidationResults::format_status(status, "  ")),
+                );
+            }
+        }
+
+        if let Some(deltas) = results.ingredient_deltas.as_ref() {
+            for delta in deltas {
+                let failures = delta
+                    .validation_deltas()
+                    .failure
+                    .iter()
+                    .filter(|status| {
+                        !is_untrusted_failure(status.code())
+                    })
+                    .collect::<Vec<_>>();
+                if !failures.is_empty() {
+                    output_lines.push(format!(
+                        "ingredient [{}] failures:",
+                        delta.ingredient_assertion_uri()
+                    ));
+                    output_lines.extend(
+                        failures
+                            .iter()
+                            .map(|status| ValidationResults::format_status(status, "  ")),
+                    );
+                }
+            }
+        }
+
+        write!(f, "{}", output_lines.join("\n"))
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -420,6 +569,15 @@ pub mod validation_codes {
     ///
     /// Any corresponding URL should point to a C2PA claim signature box.
     pub const SIGNING_CREDENTIAL_TRUSTED: &str = "signingCredential.trusted";
+
+    /// The CAWG creator-identity credential is listed on the validator's CAWG
+    /// trust list.
+    ///
+    /// This is the CAWG identity-assertion counterpart of
+    /// [`SIGNING_CREDENTIAL_TRUSTED`].
+    ///
+    /// Any corresponding URL should point to a CAWG identity assertion.
+    pub const CAWG_IDENTITY_TRUSTED: &str = "cawg.identity.trusted";
 
     /// The signing credential for the manifest has not been revoked:
     ///
@@ -639,6 +797,17 @@ pub mod validation_codes {
     ///
     /// Any corresponding URL should point to a C2PA claim signature box.
     pub const SIGNING_CREDENTIAL_UNTRUSTED: &str = "signingCredential.untrusted";
+
+    /// The CAWG creator-identity credential is not listed on the validator's
+    /// CAWG trust list.
+    ///
+    /// This is the CAWG identity-assertion counterpart of
+    /// [`SIGNING_CREDENTIAL_UNTRUSTED`]. CAWG identity trust is outside the
+    /// scope of C2PA validity, so this status does not by itself invalidate a
+    /// manifest.
+    ///
+    /// Any corresponding URL should point to a CAWG identity assertion.
+    pub const CAWG_IDENTITY_UNTRUSTED: &str = "cawg.identity.untrusted";
 
     /// The signing credential is not valid for signing.
     ///
@@ -982,6 +1151,7 @@ pub mod validation_codes {
             CLAIM_SIGNATURE_VALIDATED
             | CLAIM_SIGNATURE_INSIDE_VALIDITY
             | SIGNING_CREDENTIAL_TRUSTED
+            | CAWG_IDENTITY_TRUSTED
             | SIGNING_CREDENTIAL_NOT_REVOKED
             | TIMESTAMP_TRUSTED
             | TIMESTAMP_VALIDATED
@@ -1013,10 +1183,33 @@ pub mod validation_codes {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::validation_status::{
-        ASSERTION_DATAHASH_MISMATCH, CLAIM_MALFORMED, CLAIM_SIGNATURE_INSIDE_VALIDITY,
-        CLAIM_SIGNATURE_VALIDATED, SIGNING_CREDENTIAL_TRUSTED, SIGNING_CREDENTIAL_UNTRUSTED,
+    use crate::{
+        assertions,
+        claim::Claim,
+        jumbf::labels,
+        log_item,
+        validation_status::{
+            ASSERTION_DATAHASH_MISMATCH, ASSERTION_HASHEDURI_MISMATCH, CAWG_IDENTITY_TRUSTED,
+            CAWG_IDENTITY_UNTRUSTED, CLAIM_MALFORMED, CLAIM_SIGNATURE_INSIDE_VALIDITY,
+            CLAIM_SIGNATURE_VALIDATED, SIGNING_CREDENTIAL_TRUSTED, SIGNING_CREDENTIAL_UNTRUSTED,
+        },
+        HashedUri, Relationship,
     };
+
+    #[test]
+    fn trust_status_codes_classify_consistently() {
+        // The C2PA claim signer and the CAWG creator-identity credential each
+        // have a trusted/untrusted pair; both pairs must classify the same way.
+        for trusted in [SIGNING_CREDENTIAL_TRUSTED, CAWG_IDENTITY_TRUSTED] {
+            assert_eq!(log_kind(trusted), LogKind::Success);
+            assert!(!is_untrusted_failure(trusted));
+        }
+        for untrusted in [SIGNING_CREDENTIAL_UNTRUSTED, CAWG_IDENTITY_UNTRUSTED] {
+            assert_eq!(log_kind(untrusted), LogKind::Failure);
+            // Untrusted credentials are tolerated: Valid, but never Trusted.
+            assert!(is_untrusted_failure(untrusted));
+        }
+    }
 
     #[test]
     fn trusted_state() {
