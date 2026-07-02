@@ -215,7 +215,7 @@ async fn assertion_not_in_claim_v1() {
 
     assert_eq!(
         log.validation_status.as_ref().unwrap().as_ref() as &str,
-        "signingCredential.trusted"
+        "cawg.identity.trusted"
     );
 
     let cert_info = &sig_info.cert_info;
@@ -328,7 +328,7 @@ async fn duplicate_assertion_reference() {
     );
     assert_eq!(
         log.validation_status.as_ref().unwrap().as_ref() as &str,
-        "signingCredential.trusted"
+        "cawg.identity.trusted"
     );
 
     let cert_info = &sig_info.cert_info;
@@ -421,7 +421,7 @@ async fn no_hard_binding() {
 
     assert_eq!(
         log.validation_status.as_ref().unwrap().as_ref() as &str,
-        "signingCredential.trusted"
+        "cawg.identity.trusted"
     );
 
     let cert_info = &sig_info.cert_info;
@@ -692,7 +692,7 @@ async fn pad1_invalid() {
 
     assert_eq!(
         log.validation_status.as_ref().unwrap().as_ref() as &str,
-        "signingCredential.trusted"
+        "cawg.identity.trusted"
     );
 
     let cert_info = &sig_info.cert_info;
@@ -785,7 +785,7 @@ async fn pad2_invalid() {
 
     assert_eq!(
         log.validation_status.as_ref().unwrap().as_ref() as &str,
-        "signingCredential.trusted"
+        "cawg.identity.trusted"
     );
 
     let cert_info = &sig_info.cert_info;
