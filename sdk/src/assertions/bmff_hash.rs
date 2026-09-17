@@ -1820,12 +1820,16 @@ impl BmffHash {
                 return Err(Error::BadParam("expected 1 mdat in fragment".to_string()));
             }
 
-            // we don't currently support adding to fragments with existing manifests
-            if !c2pa_boxes.bmff_merkle.is_empty() {
-                return Err(Error::BadParam(
-                    "fragment already contains BmffMerkeMap".to_string(),
-                ));
-            }
+            let existing_merkle_box = if !c2pa_boxes.bmff_merkle.is_empty() {
+                if c2pa_boxes.bmff_merkle_box_infos.len() != 1 {
+                    return Err(Error::BadParam(
+                        "expected exactly 1 existing Merkle box in fragment".to_string(),
+                    ));
+                }
+                Some(&c2pa_boxes.bmff_merkle_box_infos[0])
+            } else {
+                None
+            };
 
             let mut mm = BmffMerkleMap {
                 unique_id,
@@ -1857,11 +1861,6 @@ impl BmffHash {
                 0,
             )?;
 
-            let first_moof = box_infos
-                .iter()
-                .find(|b| b.path == "moof")
-                .ok_or(Error::BadParam("expected 1 moof in fragment".to_string()))?;
-
             let mut source = std::fs::File::open(seg)?;
             let output_filename = seg
                 .file_name()
@@ -1874,13 +1873,31 @@ impl BmffHash {
                 .write(true)
                 .open(&dest_path)?;
 
-            // UUID to insert into output fragment with placeholder proof (will be replaced with real proof after hashing)
-            crate::utils::io_utils::insert_data_at(
-                &mut source,
-                &mut dest,
-                first_moof.offset,
-                &uuid_box_data,
-            )?;
+            if let Some(old_box) = existing_merkle_box {
+                // Replace the existing Merkle UUID box with the new placeholder.
+                // C2PA spec A.5.4.1.2 allows re-signing fragmented content.
+                crate::utils::io_utils::patch_stream(
+                    &mut source,
+                    &mut dest,
+                    old_box.start(),
+                    old_box.size(),
+                    &uuid_box_data,
+                )?;
+            } else {
+                let first_moof = box_infos
+                    .iter()
+                    .find(|b| b.path == "moof")
+                    .ok_or(Error::BadParam("expected 1 moof in fragment".to_string()))?;
+
+                // Insert new Merkle UUID box before moof with placeholder proof
+                // (will be replaced with real proof after hashing).
+                crate::utils::io_utils::insert_data_at(
+                    &mut source,
+                    &mut dest,
+                    first_moof.offset,
+                    &uuid_box_data,
+                )?;
+            }
 
             // save file path for each which location in Merkle tree
             location_to_fragment_map.insert(location, dest_path);
