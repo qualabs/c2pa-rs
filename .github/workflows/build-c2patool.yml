@@ -1,0 +1,51 @@
+name: Build c2patool binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build from'
+        required: true
+        default: 'qopybaras'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: c2patool.linux
+            binary: target/release/c2patool
+          - os: macos-latest
+            artifact: c2patool.macos
+            binary: target/release/c2patool
+          - os: windows-latest
+            artifact: c2patool.exe
+            binary: target/release/c2patool.exe
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.artifact }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Patch workspace (c2pa_c_ffi version mismatch)
+        shell: bash
+        run: |
+          sed -i.bak 's/"c2pa_c_ffi",/# "c2pa_c_ffi",/' Cargo.toml
+          sed -i.bak 's/version = "0.84.1"/version = "0.89.0"/g' cli/Cargo.toml make_test_images/Cargo.toml export_schema/Cargo.toml
+
+      - name: Build c2patool
+        run: cargo build --release --bin c2patool
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
