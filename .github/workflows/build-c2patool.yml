@@ -1,6 +1,9 @@
 name: Build c2patool binaries
 
 on:
+  push:
+    branches:
+      - qopybaras
   workflow_dispatch:
     inputs:
       branch:
@@ -8,12 +11,16 @@ on:
         required: true
         default: 'qopybaras'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             artifact: c2patool.linux
             binary: target/release/c2patool
           - os: macos-latest
@@ -49,3 +56,99 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.binary }}
+
+  update-consumers:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: develop
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: ez-drm-hosted-manifest-repository
+            readme: SharedLogic/c2pa/README.md
+            readme_row: '`c2patool.exe`, `c2patool.linux`, `c2patool.macos`'
+            files: |
+              c2patool.linux/c2patool SharedLogic/c2pa/c2patool.linux
+              c2patool.macos/c2patool SharedLogic/c2pa/c2patool.macos
+              c2patool.exe/c2patool.exe SharedLogic/c2pa/c2patool.exe
+          - repo: c2pa-live-cbc-wrapper
+            readme: bin/README.md
+            readme_row: '`c2patool`'
+            files: |
+              c2patool.linux/c2patool bin/c2patool
+
+    name: Update ${{ matrix.repo }}
+
+    steps:
+      - name: Checkout c2patool manifest
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: cli/Cargo.toml
+          sparse-checkout-cone-mode: false
+          path: source
+
+      - name: Read c2patool version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' source/cli/Cargo.toml | head -1)
+          echo "version=v${version}+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout ${{ matrix.repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ matrix.repo }}
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ secrets.BINARY_SYNC_TOKEN }}
+          path: target
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Replace binaries and update README
+        env:
+          FILES: ${{ matrix.files }}
+          README: target/${{ matrix.readme }}
+          README_ROW: ${{ matrix.readme_row }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          while read -r src dest; do
+            [ -z "$src" ] && continue
+            mode=755
+            [[ "$dest" == *.exe ]] && mode=644
+            install -m "$mode" "artifacts/$src" "target/$dest"
+          done <<< "$FILES"
+
+          row="| ${README_ROW} | [${GITHUB_REPOSITORY}](${SOURCE_URL}) branch \`${GITHUB_REF_NAME}\` @ [\`${GITHUB_SHA::8}\`](${SOURCE_URL}/commit/${GITHUB_SHA}) — built via [CI run #${GITHUB_RUN_ID}](${RUN_URL}) |"
+          prefix="| ${README_ROW} |"
+          awk -v prefix="$prefix" -v row="$row" '
+            index($0, prefix) == 1 { print row; found = 1; next }
+            { print }
+            END { if (!found) exit 1 }
+          ' "$README" > README.tmp || { echo "::error::Row ${prefix} not found in ${README}"; exit 1; }
+          mv README.tmp "$README"
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          path: target
+          token: ${{ secrets.BINARY_SYNC_TOKEN }}
+          base: ${{ env.TARGET_BRANCH }}
+          branch: chore/update-c2patool-binary
+          title: 'chore: update c2patool binary to ${{ steps.version.outputs.version }}'
+          commit-message: |
+            chore: update c2patool binary to ${{ steps.version.outputs.version }}
+
+            Built from ${{ github.repository }} @ ${{ github.ref_name }} (${{ github.sha }})
+          body: |
+            Automated update of the embedded `c2patool` binaries.
+
+            - Source: ${{ github.repository }} branch `${{ github.ref_name }}` @ ${{ github.sha }}
+            - Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Newer merges to `${{ github.ref_name }}` update this same PR.
